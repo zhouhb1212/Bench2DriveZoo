@@ -100,7 +100,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
                 result[0]['planning_traj'] = result[0]['planning']['result_planning']['sdc_traj']
                 result[0]['planning_traj_gt'] = result[0]['planning']['planning_gt']['sdc_planning']
                 result[0]['command'] = result[0]['planning']['planning_gt']['command']
-                planning_metrics(pred_sdc_traj[:, :6, :2], sdc_planning[0][0,:, :6, :2], sdc_planning_mask[0][0,:, :6, :2], segmentation[0][:, [1,2,3,4,5,6]])
+                planning_metrics(pred_sdc_traj[:, :6, :2], sdc_planning[0][None, :, :2], sdc_planning_mask[0][None, :, :2], segmentation[0][:, [1,2,3,4,5,6]])
 
             # # Eval Occ
             if eval_occ:

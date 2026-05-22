@@ -58,6 +58,15 @@ def parse_args():
         '--autoscale-lr',
         action='store_true',
         help='automatically scale lr with the number of gpus')
+    parser.add_argument(
+        '--training-stage',
+        type=int,
+        choices=[1, 2, 3],
+        help='override coupled_lora_cfg.training_stage (1/2/3)')
+    parser.add_argument(
+        '--lr',
+        type=float,
+        help='override optimizer lr (e.g. 1e-3, 5e-4)')
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -85,6 +94,18 @@ def main():
     if args.autoscale_lr:
         # apply the linear scaling rule (https://arxiv.org/abs/1706.02677)
         cfg.optimizer['lr'] = cfg.optimizer['lr'] * len(cfg.gpu_ids) / 8
+
+    # LoRA/命令行覆盖: training_stage 和 lr
+    if args.training_stage is not None:
+        if 'coupled_lora_cfg' not in cfg.model:
+            # 防止在非 LoRA 配置中误用 --training-stage，导致意外注入 LoRA
+            raise ValueError(
+                '--training-stage requires a LoRA config '
+                '(e.g. base_e2e_b2d_lora.py) that defines '
+                'model.coupled_lora_cfg')
+        cfg.model['coupled_lora_cfg']['training_stage'] = args.training_stage
+    if args.lr is not None:
+        cfg.optimizer['lr'] = args.lr
 
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':

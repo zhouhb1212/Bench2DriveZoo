@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmcv.models.builder import HEADS, build_loss
 from einops import rearrange
 from mmcv.models.utils.functional import bivariate_gaussian_activation
@@ -27,7 +28,7 @@ class PlanningHeadSingleMode(nn.Module):
                  use_col_optim=False,
                  col_optim_args=dict(
                     occ_filter_range=5.0,
-                    sigma=1.0, 
+                    sigma=1.0,
                     alpha_collision=5.0,
                  ),
                  with_adapter=False,
@@ -43,12 +44,15 @@ class PlanningHeadSingleMode(nn.Module):
             planning_eval (bool): Whether to use planning for evaluation. Default: False.
             use_col_optim (bool): Whether to use collision optimization. Default: False.
             col_optim_args (dict): Collision optimization arguments. Default: dict(occ_filter_range=5.0, sigma=1.0, alpha_collision=5.0).
+            with_adapter (bool): Whether to use BEV adapter. Default: False.
+
         """
         super(PlanningHeadSingleMode, self).__init__()
 
         # Nuscenes
         self.bev_h = bev_h
         self.bev_w = bev_w
+        self.embed_dims = embed_dims  # 保存为实例属性
         self.navi_embed = nn.Embedding(command_dim, embed_dims)
         self.reg_branch = nn.Sequential(
             nn.Linear(embed_dims, embed_dims),
@@ -92,26 +96,28 @@ class PlanningHeadSingleMode(nn.Module):
             N_Blocks = 3
             bev_adapter = [copy.deepcopy(bev_adapter_block) for _ in range(N_Blocks)]
             self.bev_adapter = nn.Sequential(*bev_adapter)
-           
+
     def forward_train(self,
-                      bev_embed, 
-                      outs_motion={}, 
-                      sdc_planning=None, 
+                      bev_embed,
+                      outs_motion={},
+                      sdc_planning=None,
                       sdc_planning_mask=None,
                       command=None,
                       gt_future_boxes=None,
+                      occ_risk_feat=None,
+                      occ_risk_mask=None,
                       ):
         """
         Perform forward planning training with the given inputs.
         Args:
             bev_embed (torch.Tensor): The input bird's eye view feature map.
             outs_motion (dict): A dictionary containing the motion outputs.
-            outs_occflow (dict): A dictionary containing the occupancy flow outputs.
             sdc_planning (torch.Tensor, optional): The self-driving car's planned trajectory.
             sdc_planning_mask (torch.Tensor, optional): The mask for the self-driving car's planning.
             command (torch.Tensor, optional): The driving command issued to the self-driving car.
             gt_future_boxes (torch.Tensor, optional): The ground truth future bounding boxes.
-            img_metas (list[dict], optional): A list of metadata information about the input images.
+            occ_risk_feat (torch.Tensor, optional): Occupancy risk features [B,T,C,H,W].
+            occ_risk_mask (torch.Tensor, optional): Occupancy risk mask [B,T,1,H,W].
 
         Returns:
             ret_dict (dict): A dictionary containing the losses and planning outputs.
@@ -121,11 +127,17 @@ class PlanningHeadSingleMode(nn.Module):
         bev_pos = outs_motion['bev_pos']
 
         occ_mask = None
-        
-        outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query, sdc_track_query, command)
+
+        return_plan_feat = (occ_risk_feat is not None)
+        outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query, sdc_track_query, command,
+                            return_plan_feat=return_plan_feat, occ_risk_mask=occ_risk_mask)
         loss_inputs = [sdc_planning, sdc_planning_mask, outs_planning, gt_future_boxes]
         losses = self.loss(*loss_inputs)
         ret_dict = dict(losses=losses, outs_motion=outs_planning)
+        if return_plan_feat and 'plan_feat' in outs_planning:
+            ret_dict['plan_feat'] = outs_planning['plan_feat']
+            ret_dict['occ_risk_feat'] = occ_risk_feat
+            ret_dict['occ_risk_mask'] = occ_risk_mask
         return ret_dict
 
     def forward_test(self, bev_embed, outs_motion={}, outs_occflow={}, command=None):
@@ -137,13 +149,15 @@ class PlanningHeadSingleMode(nn.Module):
         outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query, sdc_track_query, command)
         return outs_planning
 
-    def forward(self, 
-                bev_embed, 
-                occ_mask, 
-                bev_pos, 
-                sdc_traj_query, 
-                sdc_track_query, 
-                command):
+    def forward(self,
+                bev_embed,
+                occ_mask,
+                bev_pos,
+                sdc_traj_query,
+                sdc_track_query,
+                command,
+                return_plan_feat=False,
+                occ_risk_mask=None):
         """
         Forward pass for PlanningHeadSingleMode.
 
@@ -154,6 +168,9 @@ class PlanningHeadSingleMode(nn.Module):
             sdc_traj_query (torch.Tensor): SDC trajectory query.
             sdc_track_query (torch.Tensor): SDC track query.
             command (int): Driving command.
+            return_plan_feat (bool): If True, also returns plan_feat.
+            occ_risk_mask (torch.Tensor, optional): 驾驶风险场 [B, T, 1, H, W].
+                非 None 时，风险区域 BEV 特征被增强，使规划器显式感知风险。
 
         Returns:
             dict: A dictionary containing SDC trajectory and all SDC trajectories.
@@ -162,45 +179,61 @@ class PlanningHeadSingleMode(nn.Module):
         sdc_traj_query = sdc_traj_query[-1]
         P = sdc_traj_query.shape[1]
         sdc_track_query = sdc_track_query[:, None].expand(-1,P,-1)
-        
+
         #import pdb;pdb.set_trace()
         navi_embed = self.navi_embed.weight[command]
         navi_embed = navi_embed[None].expand(-1,P,-1)
+
         plan_query = torch.cat([sdc_traj_query, sdc_track_query, navi_embed], dim=-1)
 
         plan_query = self.mlp_fuser(plan_query).max(1, keepdim=True)[0]   # expand, then fuse  # [1, 6, 768] -> [1, 1, 256]
         plan_query = rearrange(plan_query, 'b p c -> p b c')
-        
+
+
         bev_pos = rearrange(bev_pos, 'b c h w -> (h w) b c')
         bev_feat = bev_embed +  bev_pos
-        
+
         ##### Plugin adapter #####
         if self.with_adapter:
             bev_feat = rearrange(bev_feat, '(h w) b c -> b c h w', h=self.bev_h, w=self.bev_w)
-            
+
             bev_feat = bev_feat + self.bev_adapter(bev_feat)  # residual connection
             bev_feat = rearrange(bev_feat, 'b c h w -> (h w) b c')
         ##########################
-      
+
+        # ── 风险场前向注入（零参数）：高风险区域 BEV 特征增强 ──
+        if occ_risk_mask is not None:
+            # occ_risk_mask: [B, T, 1, H, W] → pool time → [B, 1, H, W]
+            risk = occ_risk_mask.mean(dim=1)
+            # 对齐到 bev_feat 的 (h*w) 维度
+            risk = risk.flatten(2).permute(2, 0, 1)  # [(H*W), B, 1]
+            bev_feat = bev_feat * (1.0 + risk)
+
         pos_embed = self.pos_embed.weight
         plan_query = plan_query + pos_embed[None]  # [1, 1, 256]
-        
+
         # plan_query: [1, 1, 256]
         # bev_feat: [40000, 1, 256]
         plan_query = self.attn_module(plan_query, bev_feat)   # [1, 1, 256]
-        
+
         sdc_traj_all = self.reg_branch(plan_query).view((-1, self.planning_steps, 2))
         sdc_traj_all[...,:2] = torch.cumsum(sdc_traj_all[...,:2], dim=1)
         sdc_traj_all[0] = bivariate_gaussian_activation(sdc_traj_all[0])
+
         if self.use_col_optim and not self.training:
             # post process, only used when testing
             assert occ_mask is not None
             sdc_traj_all = self.collision_optimization(sdc_traj_all, occ_mask)
-        
-        return dict(
+
+        result_dict = dict(
             sdc_traj=sdc_traj_all,
             sdc_traj_all=sdc_traj_all,
         )
+
+        if return_plan_feat:
+            result_dict['plan_feat'] = plan_query  # [1, 1, 256] 用于一致性损失
+
+        return result_dict
 
     def collision_optimization(self, sdc_traj_all, occ_mask):
         """
@@ -248,4 +281,7 @@ class PlanningHeadSingleMode(nn.Module):
             loss_dict[f'loss_collision_{i}'] = loss_collision          
         loss_ade = self.loss_planning(sdc_traj_all, sdc_planning[0, :, :self.planning_steps, :2], torch.any(sdc_planning_mask[0, :, :self.planning_steps], dim=-1))
         loss_dict.update(dict(loss_ade=loss_ade))
+
         return loss_dict
+
+

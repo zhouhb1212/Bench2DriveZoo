@@ -46,7 +46,7 @@ class OccHead(BaseModule):
                  transformer_decoder=None,
 
                  attn_mask_thresh=0.5,
-                 # Loss
+                             # Loss
                  sample_ignore_mode='all_valid',
                  aux_loss_weight=1.,
 
@@ -195,7 +195,7 @@ class OccHead(BaseModule):
 
         return attn_mask, upsampled_mask_pred, ins_embed
 
-    def forward(self, x, ins_query):
+    def forward(self, x, ins_query, return_risk_features=False):
         base_state = rearrange(x, '(h w) b d -> b d h w', h=self.bev_size[0])
 
         base_state = self.bev_sampler(base_state)
@@ -265,7 +265,13 @@ class OccHead(BaseModule):
         
         # Generate final outputs
         ins_occ_logits = torch.einsum("btqc,btchw->bqthw", ins_occ_query, future_states)
-        
+
+        if return_risk_features:
+            occ_risk_feat = future_states  # [B, T, C, H, W]
+            # occ_risk_mask 由外部 risk_proj 计算（不在此处用 max(ins_occ_probs)）
+            occ_risk_mask = None
+            return mask_preds, ins_occ_logits, occ_risk_feat, occ_risk_mask
+
         return mask_preds, ins_occ_logits
 
     def merge_queries(self, outs_dict, detach_query_pos=True):
@@ -291,6 +297,7 @@ class OccHead(BaseModule):
                     gt_segmentation=None,
                     gt_instance=None,
                     gt_img_is_valid=None,
+                    return_risk_features=False,
                 ):
         # Generate warpped gt and related inputs
         gt_segmentation, gt_instance, gt_img_is_valid = self.get_occ_labels(gt_segmentation, gt_instance, gt_img_is_valid)
@@ -300,8 +307,12 @@ class OccHead(BaseModule):
         ins_query = self.merge_queries(outs_dict, self.detach_query_pos)
 
         # Forward the occ-flow model
-        mask_preds_batch, ins_seg_preds_batch = self(bev_feat, ins_query=ins_query)
-        
+        if return_risk_features:
+            mask_preds_batch, ins_seg_preds_batch, occ_risk_feat, occ_risk_mask = self(
+                bev_feat, ins_query=ins_query, return_risk_features=True)
+        else:
+            mask_preds_batch, ins_seg_preds_batch = self(bev_feat, ins_query=ins_query)
+
         # Get pred and gt
         ins_seg_targets_batch  = gt_instance # [1, 5, 200, 200] [b, t, h, w] # ins targets of a batch
         
@@ -403,6 +414,10 @@ class OccHead(BaseModule):
         loss_dict['loss_aux_dice'] = loss_aux_dice / bs
         loss_dict['loss_aux_mask'] = loss_aux_mask / bs
 
+        if return_risk_features:
+            loss_dict['occ_risk_feat'] = occ_risk_feat
+            loss_dict['occ_risk_mask'] = occ_risk_mask
+
         return loss_dict
 
     def forward_test(
@@ -427,7 +442,7 @@ class OccHead(BaseModule):
         if no_query:
             # output all zero results
             out_dict['seg_out'] = torch.zeros((1, 5, 1, 200, 200),device=bev_feat.device).long()  # [1, 5, 1, 200, 200]
-            out_dict['ins_seg_out'] = torch.zeros((1, 5, 1, 200, 200),device=bev_feat.device).long()  # [1, 5, 200, 200]
+            out_dict['ins_seg_out'] = torch.zeros((1, 5, 200, 200),device=bev_feat.device).long()  # [1, 5, 200, 200]
             return out_dict
 
 

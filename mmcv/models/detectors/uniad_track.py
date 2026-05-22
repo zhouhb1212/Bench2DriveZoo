@@ -369,6 +369,32 @@ class UniADTrack(MVXTwoStageDetector):
         assert bev_embed.shape[0] == self.bev_h * self.bev_w
         return bev_embed, bev_pos
 
+    def extract_bev_only(self, img, img_metas):
+        """Stage 1 专用：仅提取最后一帧 BEV 特征，全程 no_grad。
+
+        跳过 TrackHead 检测/匹配/MemoryBank 的全部计算，
+        仅保留 backbone → neck → BEV encoder 的特征提取链。
+
+        Args:
+            img: [B, num_frame, num_cam, C, H, W]
+            img_metas: collate 后的 img_metas
+        Returns:
+            bev_embed: [bev_h*bev_w, B, embed_dims]
+            bev_pos:  [bev_h*bev_w, B, embed_dims]
+        """
+        with torch.no_grad():
+            # 只取最后一帧图像
+            # img: [B, num_frame, num_cam, C, H, W]
+            # img_: [num_frame, num_cam, C, H, W], img_[-1] → [num_cam, C, H, W]
+            img_single = torch.stack([img_[-1, ...] for img_ in img], dim=0)
+            img_feats = self.extract_img_feat(img=img_single)
+            img_metas_single = [copy.deepcopy(img_metas[0][img.size(1) - 1])]
+            bev_embed, bev_pos = self.pts_bbox_head.get_bev_features(
+                mlvl_feats=img_feats, img_metas=img_metas_single, prev_bev=None)
+        if bev_embed.shape[1] == self.bev_h * self.bev_w:
+            bev_embed = bev_embed.permute(1, 0, 2)
+        return bev_embed, bev_pos
+
     @auto_fp16(apply_to=("img", "prev_bev"))
     def _forward_single_frame_train(
         self,

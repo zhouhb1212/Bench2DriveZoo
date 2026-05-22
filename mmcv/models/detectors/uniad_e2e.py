@@ -4,7 +4,9 @@
 # Copyright (c) OpenDriveLab. All rights reserved.                                #
 #---------------------------------------------------------------------------------#
 
+import contextlib
 import torch
+import torch.nn as nn
 from mmcv.utils import auto_fp16
 from mmcv.models import DETECTORS
 import copy
@@ -31,6 +33,7 @@ class UniAD(UniADTrack):
             occ=1.0,
             planning=1.0
         ),
+        coupled_lora_cfg=None,
         **kwargs,
     ):
         super(UniAD, self).__init__(**kwargs)
@@ -42,10 +45,58 @@ class UniAD(UniADTrack):
             self.motion_head = build_head(motion_head)
         if planning_head:
             self.planning_head = build_head(planning_head)
-        
+
         self.task_loss_weight = task_loss_weight
         assert set(task_loss_weight.keys()) == \
                {'track', 'occ', 'motion', 'map', 'planning'}
+
+        # Occupancy-Planning Coupled LoRA (三阶段训练管理器)
+        if coupled_lora_cfg is not None and occ_head is not None and planning_head is not None:
+            # 预加载 occ_head / planning_head 预训练权重到子模块
+            # 必须在 LoRA 注入之前完成，确保 inject_lora_to_linear 的 copy_() 复制的是预训练值
+            pretrained_path = coupled_lora_cfg.get('pretrained_path', None)
+            if pretrained_path and os.path.exists(pretrained_path):
+                ckpt = torch.load(pretrained_path, map_location='cpu')
+                state_dict = ckpt.get('state_dict', ckpt)
+                occ_state = {k[len('occ_head.'):]: v for k, v in state_dict.items()
+                             if k.startswith('occ_head.')}
+                plan_state = {k[len('planning_head.'):]: v for k, v in state_dict.items()
+                              if k.startswith('planning_head.')}
+                if occ_state:
+                    self.occ_head.load_state_dict(occ_state, strict=False)
+                if plan_state:
+                    self.planning_head.load_state_dict(plan_state, strict=False)
+
+            from ..dense_heads.planning_head_plugin.occ_plan_coupled_lora import OccPlanCoupledLoRA
+            self.coupled_lora = OccPlanCoupledLoRA(
+                self.occ_head, self.planning_head, coupled_lora_cfg)
+            self.coupled_lora.inject()
+            self.align_proj = self.coupled_lora.align_proj
+            self.risk_proj = self.coupled_lora.risk_proj
+            self.training_stage = coupled_lora_cfg.get('training_stage', 1)
+            self.coupled_lora.set_training_stage(self.training_stage)
+
+            # 冻结所有非 LoRA 参数（backbone/BEVFormer/其他 head），
+            # 防止被优化器纳入后 weight_decay 逐步衰减预训练权重
+            for name, param in self.named_parameters():
+                if 'lora' not in name:
+                    param.requires_grad = False
+            # re-apply stage-managed params (align_proj, risk_proj)
+            self.coupled_lora.set_training_stage(self.training_stage)
+
+            # 冻结所有 LayerNorm（仅在 LoRA 模式下，减少训练抖动 + 节省显存）
+            self._freeze_all_layernorm()
+        else:
+            self.coupled_lora = None
+            self.training_stage = 0
+
+    def _freeze_all_layernorm(self):
+        """冻结模型中所有 LayerNorm 模块。"""
+        for m in self.modules():
+            if isinstance(m, nn.LayerNorm):
+                m.eval()
+                for p in m.parameters():
+                    p.requires_grad = False
 
     @property
     def with_planning_head(self):
@@ -162,13 +213,25 @@ class UniAD(UniADTrack):
         """
         losses = dict()
         len_queue = img.size(1)
-        
 
-        losses_track, outs_track = self.forward_track_train(img, gt_bboxes_3d, gt_labels_3d, gt_past_traj, gt_past_traj_mask, gt_inds, gt_sdc_bbox, gt_sdc_label,
-                                                        l2g_t, l2g_r_mat, img_metas, timestamp)
-        losses_track = self.loss_weighted_and_prefixed(losses_track, prefix='track')
-        losses.update(losses_track)
-        
+        # Stage 1: 仅训练 OccHead LoRA
+        #   - 跳过 TrackHead 全部 forward（检测/匹配/MemoryBank）
+        #   - 跳过 MotionHead 全部 forward
+        #   - 仅提取最后一帧 BEV 特征供 OccHead 使用
+        stage1_only = (self.coupled_lora is not None and self.training_stage == 1)
+        track_ctx = torch.no_grad() if stage1_only else contextlib.nullcontext()
+
+        if stage1_only:
+            # 轻量级 BEV 特征提取（全程 no_grad，无 track decoder 计算）
+            bev_embed, bev_pos = self.extract_bev_only(img, img_metas)
+            outs_track = {"bev_embed": bev_embed, "bev_pos": bev_pos}
+        else:
+            with track_ctx:
+                losses_track, outs_track = self.forward_track_train(img, gt_bboxes_3d, gt_labels_3d, gt_past_traj, gt_past_traj_mask, gt_inds, gt_sdc_bbox, gt_sdc_label,
+                                                                l2g_t, l2g_r_mat, img_metas, timestamp)
+            losses_track = self.loss_weighted_and_prefixed(losses_track, prefix='track')
+            losses.update(losses_track)
+
         # Upsample bev for tiny version
         outs_track = self.upsample_bev_if_tiny(outs_track)
 
@@ -178,51 +241,91 @@ class UniAD(UniADTrack):
         img_metas = [each[len_queue-1] for each in img_metas]
 
         outs_seg = dict()
-        if self.with_seg_head:          
+        if self.with_seg_head and not stage1_only:
             losses_seg, outs_seg = self.seg_head.forward_train(bev_embed, img_metas,
                                                           gt_lane_labels, gt_lane_bboxes, gt_lane_masks)
-            
+
             losses_seg = self.loss_weighted_and_prefixed(losses_seg, prefix='map')
             losses.update(losses_seg)
 
         outs_motion = dict()
         # Forward Motion Head
-        if self.with_motion_head:
-            ret_dict_motion = self.motion_head.forward_train(bev_embed,
-                                                        gt_bboxes_3d, gt_labels_3d, 
-                                                        gt_fut_traj, gt_fut_traj_mask, 
-                                                        gt_sdc_fut_traj, gt_sdc_fut_traj_mask, 
-                                                        outs_track=outs_track, outs_seg=outs_seg
-                                                    )
-            losses_motion = ret_dict_motion["losses"]
+        if stage1_only:
+            # Stage 1: 跳过 MotionHead，用 dummy query 满足 OccHead 输入接口
+            B = bev_embed.shape[1]
+            outs_motion = dict(
+                track_query=torch.zeros((B, 1, 256), device=bev_embed.device),
+                track_query_pos=torch.zeros((B, 1, 256), device=bev_embed.device),
+                traj_query=torch.zeros((3, B, 1, 6, 256), device=bev_embed.device),
+                all_matched_idxes=[[-1]],
+                bev_pos=bev_pos,
+            )
+        elif self.with_motion_head:
+            with track_ctx:
+                ret_dict_motion = self.motion_head.forward_train(bev_embed,
+                                                            gt_bboxes_3d, gt_labels_3d,
+                                                            gt_fut_traj, gt_fut_traj_mask,
+                                                            gt_sdc_fut_traj, gt_sdc_fut_traj_mask,
+                                                            outs_track=outs_track, outs_seg=outs_seg
+                                                        )
             outs_motion = ret_dict_motion["outs_motion"]
             outs_motion['bev_pos'] = bev_pos
+            losses_motion = ret_dict_motion["losses"]
             losses_motion = self.loss_weighted_and_prefixed(losses_motion, prefix='motion')
             losses.update(losses_motion)
 
         # Forward Occ Head
+        occ_risk_feat = None
+        occ_risk_mask = None
         if self.with_occ_head:
-            if outs_motion['track_query'].shape[1] == 0:
+            if outs_motion['track_query'].shape[1] == 0:# avoid 0 track
                 # TODO: rm hard code
                 outs_motion['track_query'] = torch.zeros((1, 1, 256)).to(bev_embed)
                 outs_motion['track_query_pos'] = torch.zeros((1,1, 256)).to(bev_embed)
                 outs_motion['traj_query'] = torch.zeros((3, 1, 1, 6, 256)).to(bev_embed)
                 outs_motion['all_matched_idxes'] = [[-1]]
+            request_risk = (self.coupled_lora is not None and self.training_stage == 3)
             losses_occ = self.occ_head.forward_train(
-                            bev_embed, 
-                            outs_motion, 
+                            bev_embed,
+                            outs_motion,
                             gt_inds_list=gt_inds,
                             gt_segmentation=gt_segmentation,
                             gt_instance=gt_instance,
                             gt_img_is_valid=gt_occ_img_is_valid,
+                            return_risk_features=request_risk,
                         )
+            # 提取 risk features（不参与 occ 损失前缀化）
+            occ_risk_feat = losses_occ.pop('occ_risk_feat', None)
+            losses_occ.pop('occ_risk_mask', None)  # 废弃：改为由 risk_proj 计算
             losses_occ = self.loss_weighted_and_prefixed(losses_occ, prefix='occ')
             losses.update(losses_occ)
-        
 
-        # Forward Plan Head
-        if self.with_planning_head:
-            outs_planning = self.planning_head.forward_train(bev_embed, outs_motion, sdc_planning, sdc_planning_mask, command, gt_future_boxes)
+            # 通过可学习的风险投影头计算驾驶风险场
+            if occ_risk_feat is not None and self.coupled_lora is not None:
+                occ_risk_mask = self.coupled_lora.compute_risk_mask(occ_risk_feat)
+            else:
+                occ_risk_mask = None
+
+
+        # Forward Plan Head（Stage 1 不需要规划，跳过以加速训练）
+        if self.with_planning_head and not stage1_only:
+            outs_planning = self.planning_head.forward_train(
+                bev_embed, outs_motion, sdc_planning, sdc_planning_mask,
+                command, gt_future_boxes,
+                occ_risk_feat=occ_risk_feat,
+                occ_risk_mask=occ_risk_mask)
+
+            # Stage 3: 计算占用-规划一致性损失
+            if (self.coupled_lora is not None and self.training_stage == 3
+                    and 'plan_feat' in outs_planning):
+                cons_loss = self.coupled_lora.compute_consistency_loss(
+                    outs_planning['outs_motion']['sdc_traj_all'],
+                    outs_planning.get('occ_risk_feat'),
+                    outs_planning['plan_feat'],
+                    outs_planning.get('occ_risk_mask'),
+                )
+                outs_planning['losses']['consistency'] = cons_loss
+
             losses_planning = outs_planning['losses']
             losses_planning = self.loss_weighted_and_prefixed(losses_planning, prefix='planning')
             losses.update(losses_planning)
