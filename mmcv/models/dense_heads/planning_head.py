@@ -104,8 +104,6 @@ class PlanningHeadSingleMode(nn.Module):
                       sdc_planning_mask=None,
                       command=None,
                       gt_future_boxes=None,
-                      occ_risk_feat=None,
-                      occ_risk_mask=None,
                       ):
         """
         Perform forward planning training with the given inputs.
@@ -116,8 +114,6 @@ class PlanningHeadSingleMode(nn.Module):
             sdc_planning_mask (torch.Tensor, optional): The mask for the self-driving car's planning.
             command (torch.Tensor, optional): The driving command issued to the self-driving car.
             gt_future_boxes (torch.Tensor, optional): The ground truth future bounding boxes.
-            occ_risk_feat (torch.Tensor, optional): Occupancy risk features [B,T,C,H,W].
-            occ_risk_mask (torch.Tensor, optional): Occupancy risk mask [B,T,1,H,W].
 
         Returns:
             ret_dict (dict): A dictionary containing the losses and planning outputs.
@@ -128,16 +124,11 @@ class PlanningHeadSingleMode(nn.Module):
 
         occ_mask = None
 
-        return_plan_feat = (occ_risk_feat is not None)
-        outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query, sdc_track_query, command,
-                            return_plan_feat=return_plan_feat, occ_risk_mask=occ_risk_mask)
+        outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query,
+                            sdc_track_query, command)
         loss_inputs = [sdc_planning, sdc_planning_mask, outs_planning, gt_future_boxes]
         losses = self.loss(*loss_inputs)
         ret_dict = dict(losses=losses, outs_motion=outs_planning)
-        if return_plan_feat and 'plan_feat' in outs_planning:
-            ret_dict['plan_feat'] = outs_planning['plan_feat']
-            ret_dict['occ_risk_feat'] = occ_risk_feat
-            ret_dict['occ_risk_mask'] = occ_risk_mask
         return ret_dict
 
     def forward_test(self, bev_embed, outs_motion={}, outs_occflow={}, command=None):
@@ -155,9 +146,7 @@ class PlanningHeadSingleMode(nn.Module):
                 bev_pos,
                 sdc_traj_query,
                 sdc_track_query,
-                command,
-                return_plan_feat=False,
-                occ_risk_mask=None):
+                command):
         """
         Forward pass for PlanningHeadSingleMode.
 
@@ -168,9 +157,6 @@ class PlanningHeadSingleMode(nn.Module):
             sdc_traj_query (torch.Tensor): SDC trajectory query.
             sdc_track_query (torch.Tensor): SDC track query.
             command (int): Driving command.
-            return_plan_feat (bool): If True, also returns plan_feat.
-            occ_risk_mask (torch.Tensor, optional): 驾驶风险场 [B, T, 1, H, W].
-                非 None 时，风险区域 BEV 特征被增强，使规划器显式感知风险。
 
         Returns:
             dict: A dictionary containing SDC trajectory and all SDC trajectories.
@@ -201,14 +187,6 @@ class PlanningHeadSingleMode(nn.Module):
             bev_feat = rearrange(bev_feat, 'b c h w -> (h w) b c')
         ##########################
 
-        # ── 风险场前向注入（零参数）：高风险区域 BEV 特征增强 ──
-        if occ_risk_mask is not None:
-            # occ_risk_mask: [B, T, 1, H, W] → pool time → [B, 1, H, W]
-            risk = occ_risk_mask.mean(dim=1)
-            # 对齐到 bev_feat 的 (h*w) 维度
-            risk = risk.flatten(2).permute(2, 0, 1)  # [(H*W), B, 1]
-            bev_feat = bev_feat * (1.0 + risk)
-
         pos_embed = self.pos_embed.weight
         plan_query = plan_query + pos_embed[None]  # [1, 1, 256]
 
@@ -229,9 +207,6 @@ class PlanningHeadSingleMode(nn.Module):
             sdc_traj=sdc_traj_all,
             sdc_traj_all=sdc_traj_all,
         )
-
-        if return_plan_feat:
-            result_dict['plan_feat'] = plan_query  # [1, 1, 256] 用于一致性损失
 
         return result_dict
 

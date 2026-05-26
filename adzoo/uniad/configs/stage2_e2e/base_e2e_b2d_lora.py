@@ -22,8 +22,6 @@ model = dict(
         r=2,
         alpha=4,
         dropout=0.1,
-        lambda_collision=1.0,
-        lambda_align=0.1,
         pretrained_path="ckpts/uniad_base_b2d.pth",
         training_stage=1,  # 切换阶段：1 / 2 / 3
     ),
@@ -36,8 +34,23 @@ optimizer = dict(
     weight_decay=0.01,
 )
 
-# LoRA 三阶段均无未使用参数，关闭 DDP unused 检测以消除遍历开销
-find_unused_parameters = False
+# Stage 3 联合训练时，部分 LoRA 参数通过不同梯度路径参与 loss 计算，
+# DDP 需要检测 unused 参数以避免 allreduce 时梯度缓冲区未填充的错误
+find_unused_parameters = True
+
+# ── 过采样配置：针对特定场景做场景级过采样（LoRA 快速验证用）──
+data = dict(
+    train=dict(
+        oversample_cfg=dict(
+            enable=False,                            # True 时启用
+            scenarios=["ParkedObstacleTwoWays"],     # 要过采样的场景
+            ratio=10,                                # 过采样倍数
+            subset_scenes=250,                       # 训练场景总数（其他场景随机选取）
+            chunks_per_other=2,                      # 非目标场景保留的连续帧块数（每块21帧）
+            seed=42,
+        ),
+    ),
+)
 
 total_epochs = 1
 runner = dict(type="EpochBasedRunner", max_epochs=1)

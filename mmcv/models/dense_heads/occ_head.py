@@ -195,7 +195,7 @@ class OccHead(BaseModule):
 
         return attn_mask, upsampled_mask_pred, ins_embed
 
-    def forward(self, x, ins_query, return_risk_features=False):
+    def forward(self, x, ins_query):
         base_state = rearrange(x, '(h w) b d -> b d h w', h=self.bev_size[0])
 
         base_state = self.bev_sampler(base_state)
@@ -266,12 +266,6 @@ class OccHead(BaseModule):
         # Generate final outputs
         ins_occ_logits = torch.einsum("btqc,btchw->bqthw", ins_occ_query, future_states)
 
-        if return_risk_features:
-            occ_risk_feat = future_states  # [B, T, C, H, W]
-            # occ_risk_mask 由外部 risk_proj 计算（不在此处用 max(ins_occ_probs)）
-            occ_risk_mask = None
-            return mask_preds, ins_occ_logits, occ_risk_feat, occ_risk_mask
-
         return mask_preds, ins_occ_logits
 
     def merge_queries(self, outs_dict, detach_query_pos=True):
@@ -297,21 +291,16 @@ class OccHead(BaseModule):
                     gt_segmentation=None,
                     gt_instance=None,
                     gt_img_is_valid=None,
-                    return_risk_features=False,
                 ):
         # Generate warpped gt and related inputs
         gt_segmentation, gt_instance, gt_img_is_valid = self.get_occ_labels(gt_segmentation, gt_instance, gt_img_is_valid)
-        
+
         all_matched_gt_ids = outs_dict['all_matched_idxes']  # list of tensor, length bs
 
         ins_query = self.merge_queries(outs_dict, self.detach_query_pos)
 
         # Forward the occ-flow model
-        if return_risk_features:
-            mask_preds_batch, ins_seg_preds_batch, occ_risk_feat, occ_risk_mask = self(
-                bev_feat, ins_query=ins_query, return_risk_features=True)
-        else:
-            mask_preds_batch, ins_seg_preds_batch = self(bev_feat, ins_query=ins_query)
+        mask_preds_batch, ins_seg_preds_batch = self(bev_feat, ins_query=ins_query)
 
         # Get pred and gt
         ins_seg_targets_batch  = gt_instance # [1, 5, 200, 200] [b, t, h, w] # ins targets of a batch
@@ -413,10 +402,6 @@ class OccHead(BaseModule):
         loss_dict['loss_mask'] = loss_mask / bs
         loss_dict['loss_aux_dice'] = loss_aux_dice / bs
         loss_dict['loss_aux_mask'] = loss_aux_mask / bs
-
-        if return_risk_features:
-            loss_dict['occ_risk_feat'] = occ_risk_feat
-            loss_dict['occ_risk_mask'] = occ_risk_mask
 
         return loss_dict
 

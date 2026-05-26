@@ -24,7 +24,7 @@ from prettytable import PrettyTable
 
 @DATASETS.register_module()
 class B2D_E2E_Dataset(Custom3DDataset):
-    def __init__(self, queue_length=4, bev_size=(200, 200),overlap_test=False,with_velocity=True,sample_interval=5,name_mapping= None,eval_cfg = None, map_root =None,map_file=None,past_frames=4, future_frames=4,predict_frames=12,planning_frames=6,patch_size = [102.4, 102.4],point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] ,occ_receptive_field=3,occ_n_future=6,occ_filter_invalid_sample=False,occ_filter_by_valid_flag=False,eval_mod=None,*args, **kwargs):
+    def __init__(self, queue_length=4, bev_size=(200, 200),overlap_test=False,with_velocity=True,sample_interval=5,name_mapping= None,eval_cfg = None, map_root =None,map_file=None,past_frames=4, future_frames=4,predict_frames=12,planning_frames=6,patch_size = [102.4, 102.4],point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] ,occ_receptive_field=3,occ_n_future=6,occ_filter_invalid_sample=False,occ_filter_by_valid_flag=False,eval_mod=None, oversample_cfg=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.queue_length = queue_length
         self.bev_size = (200, 200)
@@ -48,8 +48,79 @@ class B2D_E2E_Dataset(Custom3DDataset):
         self.occ_only_total_frames = 7  # NOTE: hardcode, not influenced by planning   
         self.eval_mod = eval_mod     
         self.map_element_class = {'Broken':0, 'Solid':1, 'SolidSolid':2,'Center':3,'TrafficLight':4,'StopSign':5}
-        with open(self.map_file,'rb') as f: 
+        with open(self.map_file,'rb') as f:
             self.map_infos = pickle.load(f)
+        self._apply_oversample(oversample_cfg)
+
+    def _apply_oversample(self, oversample_cfg):
+        """场景级过采样：对指定场景的帧进行下采样 + 过采样。
+
+        oversample_cfg 格式::
+            dict(
+                enable=False,
+                scenarios=['ParkedObstacleTwoWays'],
+                ratio=10,
+                subset_scenes=250,
+                chunks_per_other=2,
+                seed=42,
+            )
+        """
+        if oversample_cfg is None or not oversample_cfg.get('enable', False):
+            return
+
+        scenarios = oversample_cfg.get('scenarios', [])
+        ratio = oversample_cfg.get('ratio', 10)
+        subset_scenes = oversample_cfg.get('subset_scenes', 250)
+        chunks_per_other = oversample_cfg.get('chunks_per_other', 2)
+        seed = oversample_cfg.get('seed', 42)
+
+        rng = random.Random(seed)
+
+        # 1. 按 scene (folder) 分组
+        scene_groups = {}
+        for item in self.data_infos:
+            folder = item['folder']
+            scene_groups.setdefault(folder, []).append(item)
+
+        target_folders = []
+        other_folders = []
+        for folder in scene_groups:
+            if any(s in folder for s in scenarios):
+                target_folders.append(folder)
+            else:
+                other_folders.append(folder)
+
+        # 2. 下采样：目标场景全保留，其他场景随机选取
+        n_target = len(target_folders)
+        n_other = max(0, subset_scenes - n_target)
+        selected_other = rng.sample(other_folders, min(n_other, len(other_folders)))
+
+        new_data_infos = []
+        for folder in target_folders:
+            new_data_infos.extend(scene_groups[folder])
+        # 非目标场景：保留连续帧块，保证 prepare_train_data 的队列能正常工作
+        # 每块大小 = queue_length * sample_interval + 1（默认 4*5+1=21 帧）
+        chunk_size = self.queue_length * self.sample_interval + 1
+        for folder in selected_other:
+            frames = scene_groups[folder]
+            n_chunks = min(chunks_per_other, len(frames) // chunk_size)
+            if n_chunks == 0:
+                continue
+            for c in range(n_chunks):
+                start = c * (len(frames) // n_chunks)
+                new_data_infos.extend(frames[start:start + chunk_size])
+
+        # 3. 过采样：目标场景帧复制 ratio 份
+        target_items = [item for item in new_data_infos
+                        if any(s in item['folder'] for s in scenarios)]
+        for _ in range(ratio):
+            for item in target_items:
+                new_data_infos.append(copy.deepcopy(item))
+
+        self.data_infos = new_data_infos
+        # 重建 group flag，使 DistributedGroupSampler 的索引与新 data_infos 大小一致
+        if not self.test_mode:
+            self._set_group_flag()
 
     def invert_pose(self, pose):
         inv_pose = np.eye(4)

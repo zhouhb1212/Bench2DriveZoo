@@ -71,32 +71,16 @@ class UniAD(UniADTrack):
             self.coupled_lora = OccPlanCoupledLoRA(
                 self.occ_head, self.planning_head, coupled_lora_cfg)
             self.coupled_lora.inject()
-            self.align_proj = self.coupled_lora.align_proj
-            self.risk_proj = self.coupled_lora.risk_proj
-            self.training_stage = coupled_lora_cfg.get('training_stage', 1)
-            self.coupled_lora.set_training_stage(self.training_stage)
 
             # 冻结所有非 LoRA 参数（backbone/BEVFormer/其他 head），
             # 防止被优化器纳入后 weight_decay 逐步衰减预训练权重
             for name, param in self.named_parameters():
                 if 'lora' not in name:
                     param.requires_grad = False
-            # re-apply stage-managed params (align_proj, risk_proj)
-            self.coupled_lora.set_training_stage(self.training_stage)
-
-            # 冻结所有 LayerNorm（仅在 LoRA 模式下，减少训练抖动 + 节省显存）
-            self._freeze_all_layernorm()
+            self.coupled_lora.set_training_stage(
+                coupled_lora_cfg.get('training_stage', 1))
         else:
             self.coupled_lora = None
-            self.training_stage = 0
-
-    def _freeze_all_layernorm(self):
-        """冻结模型中所有 LayerNorm 模块。"""
-        for m in self.modules():
-            if isinstance(m, nn.LayerNorm):
-                m.eval()
-                for p in m.parameters():
-                    p.requires_grad = False
 
     @property
     def with_planning_head(self):
@@ -218,7 +202,8 @@ class UniAD(UniADTrack):
         #   - 跳过 TrackHead 全部 forward（检测/匹配/MemoryBank）
         #   - 跳过 MotionHead 全部 forward
         #   - 仅提取最后一帧 BEV 特征供 OccHead 使用
-        stage1_only = (self.coupled_lora is not None and self.training_stage == 1)
+        stage1_only = (self.coupled_lora is not None
+                       and self.coupled_lora.get_current_stage() == 1)
         track_ctx = torch.no_grad() if stage1_only else contextlib.nullcontext()
 
         if stage1_only:
@@ -275,8 +260,6 @@ class UniAD(UniADTrack):
             losses.update(losses_motion)
 
         # Forward Occ Head
-        occ_risk_feat = None
-        occ_risk_mask = None
         if self.with_occ_head:
             if outs_motion['track_query'].shape[1] == 0:# avoid 0 track
                 # TODO: rm hard code
@@ -284,7 +267,6 @@ class UniAD(UniADTrack):
                 outs_motion['track_query_pos'] = torch.zeros((1,1, 256)).to(bev_embed)
                 outs_motion['traj_query'] = torch.zeros((3, 1, 1, 6, 256)).to(bev_embed)
                 outs_motion['all_matched_idxes'] = [[-1]]
-            request_risk = (self.coupled_lora is not None and self.training_stage == 3)
             losses_occ = self.occ_head.forward_train(
                             bev_embed,
                             outs_motion,
@@ -292,39 +274,16 @@ class UniAD(UniADTrack):
                             gt_segmentation=gt_segmentation,
                             gt_instance=gt_instance,
                             gt_img_is_valid=gt_occ_img_is_valid,
-                            return_risk_features=request_risk,
                         )
-            # 提取 risk features（不参与 occ 损失前缀化）
-            occ_risk_feat = losses_occ.pop('occ_risk_feat', None)
-            losses_occ.pop('occ_risk_mask', None)  # 废弃：改为由 risk_proj 计算
             losses_occ = self.loss_weighted_and_prefixed(losses_occ, prefix='occ')
             losses.update(losses_occ)
-
-            # 通过可学习的风险投影头计算驾驶风险场
-            if occ_risk_feat is not None and self.coupled_lora is not None:
-                occ_risk_mask = self.coupled_lora.compute_risk_mask(occ_risk_feat)
-            else:
-                occ_risk_mask = None
 
 
         # Forward Plan Head（Stage 1 不需要规划，跳过以加速训练）
         if self.with_planning_head and not stage1_only:
             outs_planning = self.planning_head.forward_train(
                 bev_embed, outs_motion, sdc_planning, sdc_planning_mask,
-                command, gt_future_boxes,
-                occ_risk_feat=occ_risk_feat,
-                occ_risk_mask=occ_risk_mask)
-
-            # Stage 3: 计算占用-规划一致性损失
-            if (self.coupled_lora is not None and self.training_stage == 3
-                    and 'plan_feat' in outs_planning):
-                cons_loss = self.coupled_lora.compute_consistency_loss(
-                    outs_planning['outs_motion']['sdc_traj_all'],
-                    outs_planning.get('occ_risk_feat'),
-                    outs_planning['plan_feat'],
-                    outs_planning.get('occ_risk_mask'),
-                )
-                outs_planning['losses']['consistency'] = cons_loss
+                command, gt_future_boxes)
 
             losses_planning = outs_planning['losses']
             losses_planning = self.loss_weighted_and_prefixed(losses_planning, prefix='planning')
