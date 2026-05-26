@@ -196,26 +196,40 @@ class UniAD(UniADTrack):
                     is prefixed with the corresponding task name, e.g., 'track', 'map', 'motion', 'occ', and 'planning'. The values are the calculated losses for each task.
         """
         losses = dict()
+        monitoring_losses = dict()  # 冻结 head 的监控 loss，仅用于观察不参与梯度
         len_queue = img.size(1)
 
-        # Stage 1: 仅训练 OccHead LoRA
-        #   - 跳过 TrackHead 全部 forward（检测/匹配/MemoryBank）
-        #   - 跳过 MotionHead 全部 forward
-        #   - 仅提取最后一帧 BEV 特征供 OccHead 使用
+        # 各阶段确定哪些 head 需要梯度
         stage1_only = (self.coupled_lora is not None
                        and self.coupled_lora.get_current_stage() == 1)
-        track_ctx = torch.no_grad() if stage1_only else contextlib.nullcontext()
+        stage2_only = (self.coupled_lora is not None
+                       and self.coupled_lora.get_current_stage() == 2)
+        stage3_joint = (self.coupled_lora is not None
+                        and self.coupled_lora.get_current_stage() == 3)
+
+        # 冻结 head（track/map/motion）用 no_grad 执行，节省显存和算力
+        # Stage 1: 仅 Occ LoRA 需要梯度 → track/motion 冻结
+        # Stage 2: 仅 Planning LoRA 需要梯度 → track/motion/occ 冻结
+        # Stage 3: Occ + Planning LoRA 需要梯度 → track/map/motion 冻结
+        if stage1_only:
+            frozen_heads_ctx = torch.no_grad()
+        elif stage2_only or stage3_joint:
+            frozen_heads_ctx = torch.no_grad()
+        else:
+            frozen_heads_ctx = contextlib.nullcontext()
 
         if stage1_only:
             # 轻量级 BEV 特征提取（全程 no_grad，无 track decoder 计算）
             bev_embed, bev_pos = self.extract_bev_only(img, img_metas)
             outs_track = {"bev_embed": bev_embed, "bev_pos": bev_pos}
         else:
-            with track_ctx:
-                losses_track, outs_track = self.forward_track_train(img, gt_bboxes_3d, gt_labels_3d, gt_past_traj, gt_past_traj_mask, gt_inds, gt_sdc_bbox, gt_sdc_label,
-                                                                l2g_t, l2g_r_mat, img_metas, timestamp)
+            with frozen_heads_ctx:
+                losses_track, outs_track = self.forward_track_train(
+                    img, gt_bboxes_3d, gt_labels_3d, gt_past_traj,
+                    gt_past_traj_mask, gt_inds, gt_sdc_bbox, gt_sdc_label,
+                    l2g_t, l2g_r_mat, img_metas, timestamp)
             losses_track = self.loss_weighted_and_prefixed(losses_track, prefix='track')
-            losses.update(losses_track)
+            monitoring_losses.update(losses_track)
 
         # Upsample bev for tiny version
         outs_track = self.upsample_bev_if_tiny(outs_track)
@@ -227,11 +241,12 @@ class UniAD(UniADTrack):
 
         outs_seg = dict()
         if self.with_seg_head and not stage1_only:
-            losses_seg, outs_seg = self.seg_head.forward_train(bev_embed, img_metas,
-                                                          gt_lane_labels, gt_lane_bboxes, gt_lane_masks)
-
+            with frozen_heads_ctx:
+                losses_seg, outs_seg = self.seg_head.forward_train(
+                    bev_embed, img_metas,
+                    gt_lane_labels, gt_lane_bboxes, gt_lane_masks)
             losses_seg = self.loss_weighted_and_prefixed(losses_seg, prefix='map')
-            losses.update(losses_seg)
+            monitoring_losses.update(losses_seg)
 
         outs_motion = dict()
         # Forward Motion Head
@@ -246,49 +261,56 @@ class UniAD(UniADTrack):
                 bev_pos=bev_pos,
             )
         elif self.with_motion_head:
-            with track_ctx:
-                ret_dict_motion = self.motion_head.forward_train(bev_embed,
-                                                            gt_bboxes_3d, gt_labels_3d,
-                                                            gt_fut_traj, gt_fut_traj_mask,
-                                                            gt_sdc_fut_traj, gt_sdc_fut_traj_mask,
-                                                            outs_track=outs_track, outs_seg=outs_seg
-                                                        )
+            with frozen_heads_ctx:
+                ret_dict_motion = self.motion_head.forward_train(
+                    bev_embed,
+                    gt_bboxes_3d, gt_labels_3d,
+                    gt_fut_traj, gt_fut_traj_mask,
+                    gt_sdc_fut_traj, gt_sdc_fut_traj_mask,
+                    outs_track=outs_track, outs_seg=outs_seg)
             outs_motion = ret_dict_motion["outs_motion"]
             outs_motion['bev_pos'] = bev_pos
             losses_motion = ret_dict_motion["losses"]
             losses_motion = self.loss_weighted_and_prefixed(losses_motion, prefix='motion')
-            losses.update(losses_motion)
+            monitoring_losses.update(losses_motion)
 
-        # Forward Occ Head
+        # Forward Occ Head（LoRA 可训练：Stage 1/3）
         if self.with_occ_head:
             if outs_motion['track_query'].shape[1] == 0:# avoid 0 track
-                # TODO: rm hard code
                 outs_motion['track_query'] = torch.zeros((1, 1, 256)).to(bev_embed)
                 outs_motion['track_query_pos'] = torch.zeros((1,1, 256)).to(bev_embed)
                 outs_motion['traj_query'] = torch.zeros((3, 1, 1, 6, 256)).to(bev_embed)
                 outs_motion['all_matched_idxes'] = [[-1]]
-            losses_occ = self.occ_head.forward_train(
-                            bev_embed,
-                            outs_motion,
-                            gt_inds_list=gt_inds,
-                            gt_segmentation=gt_segmentation,
-                            gt_instance=gt_instance,
-                            gt_img_is_valid=gt_occ_img_is_valid,
-                        )
+            occ_ctx = torch.no_grad() if stage2_only else contextlib.nullcontext()
+            with occ_ctx:
+                losses_occ = self.occ_head.forward_train(
+                    bev_embed,
+                    outs_motion,
+                    gt_inds_list=gt_inds,
+                    gt_segmentation=gt_segmentation,
+                    gt_instance=gt_instance,
+                    gt_img_is_valid=gt_occ_img_is_valid,
+                )
             losses_occ = self.loss_weighted_and_prefixed(losses_occ, prefix='occ')
             losses.update(losses_occ)
 
-
-        # Forward Plan Head（Stage 1 不需要规划，跳过以加速训练）
+        # Forward Plan Head（LoRA 可训练：Stage 2/3；Stage 1 跳过以加速训练）
         if self.with_planning_head and not stage1_only:
             outs_planning = self.planning_head.forward_train(
                 bev_embed, outs_motion, sdc_planning, sdc_planning_mask,
                 command, gt_future_boxes)
-
             losses_planning = outs_planning['losses']
             losses_planning = self.loss_weighted_and_prefixed(losses_planning, prefix='planning')
             losses.update(losses_planning)
-        
+
+        # 精简监控 loss：每个冻结 head 只保留最典型的一个，用于判断特征质量是否稳定
+        kept_prefixes = set()
+        for k, v in monitoring_losses.items():
+            prefix = k.split('.')[0]  # track / map / motion
+            if prefix not in kept_prefixes:
+                losses[k] = v
+                kept_prefixes.add(prefix)
+
         for k,v in losses.items():
             losses[k] = torch.nan_to_num(v)
         return losses

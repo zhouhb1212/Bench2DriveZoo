@@ -36,7 +36,7 @@ optimizer = dict(
 
 # Stage 3 联合训练时，部分 LoRA 参数通过不同梯度路径参与 loss 计算，
 # DDP 需要检测 unused 参数以避免 allreduce 时梯度缓冲区未填充的错误
-find_unused_parameters = True
+find_unused_parameters = False
 
 # ── 过采样配置：针对特定场景做场景级过采样（LoRA 快速验证用）──
 data = dict(
