@@ -42,11 +42,10 @@ find_unused_parameters = False
 data = dict(
     train=dict(
         oversample_cfg=dict(
-            enable=False,                            # True 时启用
+            enable=True,                            # True 时启用
             scenarios=["ParkedObstacleTwoWays"],     # 要过采样的场景
-            ratio=10,                                # 过采样倍数
-            subset_scenes=250,                       # 训练场景总数（其他场景随机选取）
-            chunks_per_other=2,                      # 非目标场景保留的连续帧块数（每块21帧）
+            ratio=3,                                 # 额外复制轮数（总出现 = 1+ratio 次）
+            max_other_frames=5000,                   # 其他场景总帧数上限（所有场景全覆盖）
             seed=42,
         ),
     ),

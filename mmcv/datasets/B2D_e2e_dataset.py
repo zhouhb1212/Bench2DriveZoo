@@ -1,4 +1,5 @@
 import copy
+import re
 import numpy as np
 import os
 from os import path as osp
@@ -52,69 +53,89 @@ class B2D_E2E_Dataset(Custom3DDataset):
             self.map_infos = pickle.load(f)
         self._apply_oversample(oversample_cfg)
 
+    @staticmethod
+    def _extract_scenario(folder):
+        """从 folder 名提取场景类型。
+
+        v1/ParkedObstacleTwoWays_Town12_Route1171_Weather1
+        → ParkedObstacleTwoWays
+        """
+        name = folder.rsplit('/', 1)[-1]
+        return re.split(r'_Town\d+', name)[0]
+
     def _apply_oversample(self, oversample_cfg):
-        """场景级过采样：对指定场景的帧进行下采样 + 过采样。
+        """场景级过采样：对指定场景的帧进行过采样，其他场景均匀稀疏采样。
 
         oversample_cfg 格式::
             dict(
                 enable=False,
                 scenarios=['ParkedObstacleTwoWays'],
-                ratio=10,
-                subset_scenes=250,
-                chunks_per_other=2,
+                ratio=9,
+                max_other_frames=5000,
                 seed=42,
             )
+
+        逻辑:
+            - 目标场景: 全量帧 × (1 + ratio)
+            - 其他场景: 所有场景类型都覆盖，总帧数 ≤ max_other_frames
+              每类至少 1 个 chunk（从该类帧最长的子路线取），预算均匀分配
         """
         if oversample_cfg is None or not oversample_cfg.get('enable', False):
             return
 
         scenarios = oversample_cfg.get('scenarios', [])
-        ratio = oversample_cfg.get('ratio', 10)
-        subset_scenes = oversample_cfg.get('subset_scenes', 250)
-        chunks_per_other = oversample_cfg.get('chunks_per_other', 2)
-        seed = oversample_cfg.get('seed', 42)
+        ratio = oversample_cfg.get('ratio', 3)
+        max_other_frames = oversample_cfg.get('max_other_frames', 5000)
 
-        rng = random.Random(seed)
-
-        # 1. 按 scene (folder) 分组
-        scene_groups = {}
+        # 1. 按场景类型分组（43 类）
+        #    target_groups: scenario → list of frames (全量保留)
+        #    other_by_type:  scenario → {folder: [frames]} (按子路线细分，保证时序连续)
+        target_groups = {}
+        other_by_type = {}
+        _sc_cache = {}  # folder → scenario type 缓存，避免重复 _extract_scenario
         for item in self.data_infos:
             folder = item['folder']
-            scene_groups.setdefault(folder, []).append(item)
-
-        target_folders = []
-        other_folders = []
-        for folder in scene_groups:
-            if any(s in folder for s in scenarios):
-                target_folders.append(folder)
+            scenario = _sc_cache.get(folder)
+            if scenario is None:
+                scenario = self._extract_scenario(folder)
+                _sc_cache[folder] = scenario
+            if any(s in scenario for s in scenarios):
+                target_groups.setdefault(scenario, []).append(item)
             else:
-                other_folders.append(folder)
-
-        # 2. 下采样：目标场景全保留，其他场景随机选取
-        n_target = len(target_folders)
-        n_other = max(0, subset_scenes - n_target)
-        selected_other = rng.sample(other_folders, min(n_other, len(other_folders)))
+                other_by_type.setdefault(
+                    scenario, {}).setdefault(folder, []).append(item)
 
         new_data_infos = []
-        for folder in target_folders:
-            new_data_infos.extend(scene_groups[folder])
-        # 非目标场景：保留连续帧块，保证 prepare_train_data 的队列能正常工作
-        # 每块大小 = queue_length * sample_interval + 1（默认 4*5+1=21 帧）
+
+        # 2. 目标场景：全量帧保留
+        for frames in target_groups.values():
+            new_data_infos.extend(frames)
+
+        # 3. 其他场景：每类取最长子路线的 chunk，全覆盖，总帧数 ≤ max_other_frames
         chunk_size = self.queue_length * self.sample_interval + 1
-        for folder in selected_other:
-            frames = scene_groups[folder]
-            n_chunks = min(chunks_per_other, len(frames) // chunk_size)
+        n_other = len(other_by_type)
+
+        min_frames_total = n_other * chunk_size
+        budget = max(min_frames_total, max_other_frames)
+        frames_per_type = budget // n_other
+        chunks_per_type = max(1, frames_per_type // chunk_size)
+
+        for scenario, folder_groups in other_by_type.items():
+            # 取该场景类型中帧最多的子路线（保证 chunk 不跨越子路线边界）
+            longest_folder = max(folder_groups, key=lambda f: len(folder_groups[f]))
+            frames = folder_groups[longest_folder]
+            n_chunks = min(chunks_per_type, len(frames) // chunk_size)
             if n_chunks == 0:
                 continue
             for c in range(n_chunks):
                 start = c * (len(frames) // n_chunks)
                 new_data_infos.extend(frames[start:start + chunk_size])
 
-        # 3. 过采样：目标场景帧复制 ratio 份
-        target_items = [item for item in new_data_infos
-                        if any(s in item['folder'] for s in scenarios)]
+        # 4. 过采样：目标场景帧复制 ratio 份
+        all_target_frames = [item for frames in target_groups.values()
+                             for item in frames]
         for _ in range(ratio):
-            for item in target_items:
+            for item in all_target_frames:
                 new_data_infos.append(copy.deepcopy(item))
 
         self.data_infos = new_data_infos
