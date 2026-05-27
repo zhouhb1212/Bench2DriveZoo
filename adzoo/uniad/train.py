@@ -8,8 +8,9 @@ from os import path as osp
 from mmcv import __version__ as mmcv_version
 from mmcv.datasets import build_dataset
 from mmcv.models import build_model
-from mmcv.utils import collect_env, get_root_logger, mkdir_or_exist, set_random_seed, get_dist_info, init_dist, \
-                    Config, DictAction, TORCH_VERSION, digit_version
+from mmcv.utils import (build_from_cfg, collect_env, get_root_logger, mkdir_or_exist,
+                        set_random_seed, get_dist_info, init_dist, Config, DictAction,
+                        TORCH_VERSION, digit_version)
 from mmcv.datasets.builder import build_dataloader
 from mmcv.optims import build_optimizer
 from torch.nn.parallel import DataParallel, DistributedDataParallel
@@ -182,17 +183,31 @@ def main():
         model = DataParallel(model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
 
     # Optimizer
-    optimizer = build_optimizer(model, cfg.optimizer)
-    optimizer_config = OptimizerHook(**cfg.optimizer_config)
+    if hasattr(model, 'module'):
+        inner = model.module
+    else:
+        inner = model
 
-    # Runner
+    if hasattr(inner, 'coupled_lora') and inner.coupled_lora is not None:
+        # LoRA 模式：只优化 LoRA 参数，避免 weight_decay 衰减冻结的预训练权重
+        from mmcv.optims.optimizer import OPTIMIZERS
+        optimizer_cfg = copy.deepcopy(cfg.optimizer)
+        optimizer_cfg.pop('paramwise_cfg', None)
+        optimizer_cfg['params'] = inner.coupled_lora.get_lora_params()
+        optimizer = build_from_cfg(optimizer_cfg, OPTIMIZERS)
+        logger.info(f'[LoRA] Optimizer built with {sum(p.numel() for p in optimizer_cfg["params"]):,} params')
+    else:
+        optimizer = build_optimizer(model, cfg.optimizer)
+
+    # AMP: 通过 cfg.optimizer_config.type 选择 OptimizerHook 或 Fp16OptimizerHook
+    # 不在此硬编码，传给 register_optimizer_hook() 按 type 字段构建
     runner = build_runner(cfg.runner, default_args=dict(model=model,
                                                         optimizer=optimizer,
                                                         work_dir=cfg.work_dir,
                                                         logger=logger,
                                                         meta=meta))
     runner.timestamp = timestamp
-    runner.register_training_hooks(cfg.lr_config, optimizer_config,
+    runner.register_training_hooks(cfg.lr_config, cfg.optimizer_config,
                                    cfg.checkpoint_config, cfg.log_config,
                                    cfg.get('momentum_config', None))
     if distributed:

@@ -79,6 +79,7 @@ class UniAD(UniADTrack):
                     param.requires_grad = False
             self.coupled_lora.set_training_stage(
                 coupled_lora_cfg.get('training_stage', 1))
+            self.coupled_lora.log_trainable_param_count()
         else:
             self.coupled_lora = None
 
@@ -313,6 +314,14 @@ class UniAD(UniADTrack):
 
         for k,v in losses.items():
             losses[k] = torch.nan_to_num(v)
+
+        # LoRA 权重变化监控：每 200 iter 输出 lora_B 相对变化量
+        if self.training and self.coupled_lora is not None:
+            lora_delta = self.coupled_lora.log_lora_delta()
+            if lora_delta is not None:
+                # key 不含 'loss'，_parse_losses 仅记录为指标不参与梯度求和
+                losses['lora_delta'] = torch.tensor(lora_delta, device=img.device)
+
         return losses
     
     def loss_weighted_and_prefixed(self, loss_dict, prefix=''):

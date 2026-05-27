@@ -19,8 +19,8 @@ load_from = "ckpts/uniad_base_b2d.pth"
 # ── Occupancy-Planning Coupled LoRA 配置 ──
 model = dict(
     coupled_lora_cfg=dict(
-        r=2,
-        alpha=4,
+        r=8,
+        alpha=16,
         dropout=0.1,
         pretrained_path="ckpts/uniad_base_b2d.pth",
         training_stage=1,  # 切换阶段：1 / 2 / 3
@@ -44,8 +44,8 @@ data = dict(
         oversample_cfg=dict(
             enable=True,                            # True 时启用
             scenarios=["ParkedObstacleTwoWays"],     # 要过采样的场景
-            ratio=3,                                 # 额外复制轮数（总出现 = 1+ratio 次）
-            max_other_frames=5000,                   # 其他场景总帧数上限（所有场景全覆盖）
+            ratio=2,                                 # 额外复制轮数（总出现 = 1+ratio 次）
+            max_other_frames=20000,                  # 其他场景总帧数上限（所有场景全覆盖）
             seed=42,
         ),
     ),
@@ -56,11 +56,17 @@ runner = dict(type="EpochBasedRunner", max_epochs=1)
 
 # ── 减少 IO 频率（Stage 1 训练步数少，降低 checkpoint/日志/评估开销）──
 checkpoint_config = dict(interval=6000, by_epoch=False)
-evaluation = dict(interval=6)
+evaluation = dict(interval=3000, by_epoch=False)
 log_config = dict(
     interval=200,
     hooks=[
         dict(type="TextLoggerHook"),
         dict(type="TensorboardLoggerHook"),
     ],
+)
+
+# ── AMP 混合精度训练 ──
+optimizer_config = dict(
+    type='Fp16OptimizerHook',
+    grad_clip=dict(max_norm=35, norm_type=2),
 )

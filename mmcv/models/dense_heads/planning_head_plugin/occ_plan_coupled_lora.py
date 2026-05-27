@@ -45,6 +45,7 @@ class OccPlanCoupledLoRA:
 
         self._injected = False
         self._current_stage = 0
+        self._step_counter = 0
 
     # ------------------------------------------------------------------#
     # LoRA 注入
@@ -60,7 +61,6 @@ class OccPlanCoupledLoRA:
         self._freeze_all()
 
     def _freeze_all(self):
-        """冻结 OccHead 和 PlanningHead 全部参数。"""
         for p in self.occ_head.parameters():
             p.requires_grad = False
         for p in self.planning_head.parameters():
@@ -172,8 +172,10 @@ class OccPlanCoupledLoRA:
         # 冻结 OccHead / PlanningHead 内所有 LayerNorm
         self._freeze_layernorm()
 
+        # 保存基线快照，用于后续 lora_delta 监控
+        self.snapshot_lora_weights()
+
     def _freeze_layernorm(self):
-        """冻结 OccHead 和 PlanningHead 内所有 LayerNorm（eval + requires_grad=False）。"""
         for head in [self.occ_head, self.planning_head]:
             for m in head.modules():
                 if isinstance(m, nn.LayerNorm):
@@ -190,6 +192,44 @@ class OccPlanCoupledLoRA:
         """获取所有可训练 LoRA 参数，用于构建优化器。"""
         params = collect_lora_params(self.occ_head) + collect_lora_params(self.planning_head)
         return params
+
+    def _build_lora_b_refs(self):
+        """一次性扫描 occ_head/planning_head，缓存所有 lora_B 参数引用。"""
+        refs = {}
+        for prefix, head in [('occ_head', self.occ_head),
+                             ('planning_head', self.planning_head)]:
+            for name, param in head.named_parameters():
+                if 'lora_B' in name:
+                    refs[f'{prefix}.{name}'] = param
+        return refs
+
+    def snapshot_lora_weights(self):
+        self._step_counter = 0
+        self._lora_b_refs = self._build_lora_b_refs()
+        self._baseline_lora_b = {}
+        for name, param in self._lora_b_refs.items():
+            self._baseline_lora_b[name] = param.data.clone()
+
+    def log_lora_delta(self, log_interval=200):
+        """每 log_interval 步返回 lora_B 相对变化量的均值。
+
+        若持续为 0 说明 LoRA 梯度未流动；若持续增大说明不收敛。
+        """
+        self._step_counter += 1
+        if self._step_counter % log_interval != 0:
+            return None
+        rel_deltas = []
+        for name, param in self._lora_b_refs.items():
+            if name in self._baseline_lora_b:
+                base = self._baseline_lora_b[name]
+                if base.device != param.device:
+                    base = base.to(param.device)
+                    self._baseline_lora_b[name] = base
+                delta = (param.data - base).norm().item()
+                base_norm = base.norm().item()
+                rel_deltas.append(delta / base_norm if base_norm > 1e-8 else 0.0)
+                base.copy_(param.data)
+        return sum(rel_deltas) / len(rel_deltas) if rel_deltas else 0.0
 
     def get_current_stage(self):
         return self._current_stage
