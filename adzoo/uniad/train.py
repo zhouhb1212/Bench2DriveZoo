@@ -233,8 +233,11 @@ def main():
         nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
     )
     eval_cfg = cfg.get('evaluation', {})
-    eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
-    eval_cfg['jsonfile_prefix'] = osp.join('val', cfg.work_dir, time.ctime().replace(' ','_').replace(':','_'))
+    eval_cfg.setdefault('by_epoch', cfg.runner['type'] != 'IterBasedRunner')
+    # 验证结果保存到 work_dir/val/<timestamp>/ 下，使用绝对路径避免 cwd 依赖
+    eval_cfg['jsonfile_prefix'] = osp.join(
+        osp.abspath(cfg.work_dir), 'val',
+        time.strftime('%Y%m%d_%H%M%S', time.localtime()))
     eval_hook = CustomDistEvalHook if distributed else EvalHook
     runner.register_hook(eval_hook(val_dataloader, test_fn=custom_multi_gpu_test, **eval_cfg))
 

@@ -30,14 +30,15 @@ class LoRAAdapter(nn.Module):
         self.scaling = alpha / r
 
         # LoRA低秩矩阵
-        self.lora_A = nn.Parameter(torch.randn(r, in_features) * 0.01)
+        self.lora_A = nn.Parameter(torch.empty(r, in_features))
         self.lora_B = nn.Parameter(torch.zeros(out_features, r))
+
+        # 初始化：A 用 Kaiming uniform（与原始 LoRA 论文一致），B 为零
+        nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
+        nn.init.zeros_(self.lora_B)
 
         # Dropout
         self.dropout = nn.Dropout(dropout)
-
-        # 初始化B为零矩阵，确保初始状态等价于原始线性层
-        nn.init.zeros_(self.lora_B)
 
     def forward(self, x):
         """
@@ -236,15 +237,17 @@ class LoRAMultiheadAttention(nn.Module):
         # ── LoRA for in_proj (Q/K/V combined) ──
         # lora_A_in: [r, embed_dim], lora_B_in: [3*embed_dim, r]
         # delta_W = lora_B_in @ lora_A_in → [3*embed_dim, embed_dim]
-        self.lora_A_in = nn.Parameter(torch.randn(r, embed_dim) * 0.01)
+        self.lora_A_in = nn.Parameter(torch.empty(r, embed_dim))
         self.lora_B_in = nn.Parameter(torch.zeros(3 * embed_dim, r))
+        nn.init.kaiming_uniform_(self.lora_A_in, a=5**0.5)
         nn.init.zeros_(self.lora_B_in)
 
         # ── LoRA for out_proj ──
         # lora_A_out: [r, embed_dim], lora_B_out: [embed_dim, r]
         # delta_W = lora_B_out @ lora_A_out → [embed_dim, embed_dim]
-        self.lora_A_out = nn.Parameter(torch.randn(r, embed_dim) * 0.01)
+        self.lora_A_out = nn.Parameter(torch.empty(r, embed_dim))
         self.lora_B_out = nn.Parameter(torch.zeros(embed_dim, r))
+        nn.init.kaiming_uniform_(self.lora_A_out, a=5**0.5)
         nn.init.zeros_(self.lora_B_out)
 
         self.lora_dropout = nn.Dropout(dropout)

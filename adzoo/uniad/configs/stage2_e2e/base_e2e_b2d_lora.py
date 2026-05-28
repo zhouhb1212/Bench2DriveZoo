@@ -3,12 +3,12 @@
 #
 # 基于 base_e2e_b2d.py，增加 LoRA 微调相关配置。
 #
-# 三阶段训练：
-#   Stage 1 (training_stage=1): 仅 OccHead LoRA，lr=1e-3，epochs=1
-#   Stage 2 (training_stage=2): 仅 PlanningHead LoRA，lr=1e-3
-#   Stage 3 (training_stage=3): 两者联合 + 一致性损失，lr=5e-4
+# 三阶段训练（必须按顺序执行）：
+#   Stage 1 (training_stage=1): 仅 OccHead LoRA，lr=2e-4，epochs=1~2
+#   Stage 2 (training_stage=2): 仅 PlanningHead LoRA，lr=2e-4，resume Stage1 ckpt
+#   Stage 3 (training_stage=3): 两者联合微调，lr=5e-5，resume Stage2 ckpt
 #
-# 用法：修改下方 training_stage 和 optimizer.lr 后运行相同命令
+# 用法：通过命令行 --training-stage 和 --lr 覆盖
 # ---------------------------------------------------------------------------------#
 
 _base_ = ["./base_e2e_b2d.py"]
@@ -20,18 +20,27 @@ load_from = "ckpts/uniad_base_b2d.pth"
 model = dict(
     coupled_lora_cfg=dict(
         r=8,
-        alpha=16,
-        dropout=0.1,
+        alpha=8,       # scale = alpha/r = 1，降低 LoRA 输出放大系数，减少对预训练特征的扰动
+        dropout=0.05,  # 降低 dropout，减少随机性带来的梯度噪声
         pretrained_path="ckpts/uniad_base_b2d.pth",
         training_stage=1,  # 切换阶段：1 / 2 / 3
+    ),
+    # Stage 3 联合训练时降低 planning 权重，避免 collision loss 主导梯度
+    # collision_0/1/2 数值远大于 occ dice/mask loss，需要平衡
+    task_loss_weight=dict(
+        track=1.0,
+        map=1.0,
+        motion=1.0,
+        occ=1.0,
+        planning=0.5,  # 原始 1.0 → 0.5，平衡 occ/planning 梯度贡献
     ),
 )
 
 # ── 优化器（仅 LoRA 参数 requires_grad=True，其余已冻结）──
 optimizer = dict(
     type="AdamW",
-    lr=3e-4,  # LoRA 学习率低于全量微调 (2e-4)，但 scale=alpha/r 有放大效应
-    weight_decay=0.01,
+    lr=2e-4,      # Stage 1/2 建议 2e-4；Stage 3 建议 5e-5
+    weight_decay=0.05,  # 增大正则化，防止 LoRA 参数过大振荡
 )
 
 # Stage 3 联合训练时，部分 LoRA 参数通过不同梯度路径参与 loss 计算，
@@ -54,9 +63,16 @@ data = dict(
 total_epochs = 1
 runner = dict(type="EpochBasedRunner", max_epochs=1)
 
-# ── 减少 IO 频率（Stage 1 训练步数少，降低 checkpoint/日志/评估开销）──
-checkpoint_config = dict(interval=6000, by_epoch=False)
-evaluation = dict(interval=3000, by_epoch=False)
+# ── Checkpoint 和验证频率 ──
+# 总 iter 约 6600（1 epoch），checkpoint 每 3000 iter 保存一次
+checkpoint_config = dict(
+    interval=3000,
+    by_epoch=False,
+    # 文件命名：iter_3000.pth, iter_6000.pth, ...
+    # epoch 结束时额外保存 epoch_1.pth
+)
+# 验证每 epoch 结束时执行一次（by_epoch=True, interval=1）
+evaluation = dict(interval=1, by_epoch=True)
 log_config = dict(
     interval=200,
     hooks=[
@@ -68,5 +84,15 @@ log_config = dict(
 # ── AMP 混合精度训练 ──
 optimizer_config = dict(
     type='Fp16OptimizerHook',
-    grad_clip=dict(max_norm=35, norm_type=2),
+    grad_clip=dict(max_norm=10, norm_type=2),  # LoRA 参数少，用更紧的梯度裁剪防止不稳定
+)
+
+# ── 学习率调度 ──
+lr_config = dict(
+    by_epoch=False,
+    policy="CosineAnnealing",
+    warmup="linear",
+    warmup_iters=500,   # warmup 步数
+    warmup_ratio=1.0 / 3,
+    min_lr_ratio=1e-2,  # 最终 lr 衰减到 peak 的 1%，确保后期稳定收敛
 )

@@ -165,7 +165,11 @@ class EpochBasedRunner(BaseRunner):
             # More details in https://github.com/open-mmlab/mmcv/pull/1108
         meta.update(epoch=self.epoch + 1, iter=self.iter)
 
-        filename = filename_tmpl.format(self.epoch + 1)
+        # 根据 filename_tmpl 决定使用 epoch 还是 iter 编号
+        if 'iter' in filename_tmpl:
+            filename = filename_tmpl.format(self.iter + 1)
+        else:
+            filename = filename_tmpl.format(self.epoch + 1)
         filepath = osp.join(out_dir, filename)
         optimizer = self.optimizer if save_optimizer else None
         save_checkpoint(self.model, filepath, optimizer=optimizer, meta=meta)

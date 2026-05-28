@@ -305,11 +305,14 @@ class UniAD(UniADTrack):
             losses.update(losses_planning)
 
         # 精简监控 loss：每个冻结 head 只保留最典型的一个，用于判断特征质量是否稳定
+        # 注意：key 中将 'loss' 替换为 'mon'，避免被 _parse_losses 纳入梯度求和；
+        #       值用 .detach() 彻底切断计算图，确保不影响反向传播
         kept_prefixes = set()
         for k, v in monitoring_losses.items():
             prefix = k.split('.')[0]  # track / map / motion
             if prefix not in kept_prefixes:
-                losses[k] = v
+                mon_key = k.replace('loss', 'mon')
+                losses[mon_key] = v.detach()
                 kept_prefixes.add(prefix)
 
         for k,v in losses.items():
