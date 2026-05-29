@@ -101,6 +101,20 @@ class CheckpointHook(Hook):
 
     def after_train_epoch(self, runner):
         if not self.by_epoch:
+            # Force epoch-end checkpoint saving even if by_epoch=False
+            runner.logger.info(
+                f'Saving checkpoint at the end of epoch {runner.epoch + 1}')
+            if self.sync_buffer:
+                allreduce_params(runner.model.buffers())
+            save_args = dict(self.args)
+            save_args['filename_tmpl'] = 'epoch_{}.pth'
+            runner.save_checkpoint(
+                self.out_dir, save_optimizer=self.save_optimizer, **save_args)
+            if runner.meta is not None:
+                cur_ckpt_filename = 'epoch_{}.pth'.format(runner.epoch + 1)
+                runner.meta.setdefault('hook_msgs', dict())
+                runner.meta['hook_msgs']['last_ckpt'] = self.file_client.join_path(
+                    self.out_dir, cur_ckpt_filename)
             return
 
         # save checkpoint for following cases:

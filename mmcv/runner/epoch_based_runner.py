@@ -43,9 +43,22 @@ class EpochBasedRunner(BaseRunner):
         self.mode = 'train'
         self.data_loader = data_loader
         self._max_iters = self._max_epochs * len(self.data_loader)
+
+        # Check for mid-epoch resume
+        skip_iters = self._iter % len(self.data_loader)
+        if skip_iters > 0:
+            new_epoch = self._iter // len(self.data_loader)
+            self.logger.info(
+                f"Resuming from mid-epoch: adjusting runner.epoch from {self._epoch} to {new_epoch}, "
+                f"skipping first {skip_iters} iterations of the dataset."
+            )
+            self._epoch = new_epoch
+
         self.call_hook('before_train_epoch')
         time.sleep(2)  # Prevent possible deadlock during epoch transition
         for i, data_batch in enumerate(self.data_loader):
+            if i < skip_iters:
+                continue
             self._inner_iter = i
             self.call_hook('before_train_iter')
             self.run_iter(data_batch, train_mode=True, **kwargs)

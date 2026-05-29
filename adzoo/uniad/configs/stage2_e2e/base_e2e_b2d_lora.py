@@ -39,7 +39,7 @@ model = dict(
 # ── 优化器（仅 LoRA 参数 requires_grad=True，其余已冻结）──
 optimizer = dict(
     type="AdamW",
-    lr=2e-4,      # Stage 1/2 建议 2e-4；Stage 3 建议 5e-5
+    lr=3e-4,      # 梯度累积 4 步 → 等效 batch=4，按线性缩放 lr（2e-4 × 2）
     weight_decay=0.05,  # 增大正则化，防止 LoRA 参数过大振荡
 )
 
@@ -53,15 +53,15 @@ data = dict(
         oversample_cfg=dict(
             enable=True,                            # True 时启用
             scenarios=["ParkedObstacleTwoWays"],     # 要过采样的场景
-            ratio=2,                                 # 额外复制轮数（总出现 = 1+ratio 次）
-            max_other_frames=20000,                  # 其他场景总帧数上限（所有场景全覆盖）
+            ratio=1,                                 # 额外复制轮数（总出现 = 1+ratio 次）
+            max_other_frames=15000,                  # 其他场景总帧数上限（所有场景全覆盖）
             seed=42,
         ),
     ),
 )
 
-total_epochs = 1
-runner = dict(type="EpochBasedRunner", max_epochs=1)
+total_epochs = 2
+runner = dict(type="EpochBasedRunner", max_epochs=2)
 
 # ── Checkpoint 和验证频率 ──
 # 总 iter 约 6600（1 epoch），checkpoint 每 3000 iter 保存一次
@@ -81,10 +81,13 @@ log_config = dict(
     ],
 )
 
-# ── AMP 混合精度训练 ──
+# ── AMP 混合精度 + 梯度累积 ──
+# 累积 4 个 batch 的梯度再更新，等效 batch_size=4
+# 减少因单场景梯度噪声导致的严重震荡（理论方差降为 1/4）
 optimizer_config = dict(
-    type='Fp16OptimizerHook',
-    grad_clip=dict(max_norm=10, norm_type=2),  # LoRA 参数少，用更紧的梯度裁剪防止不稳定
+    type='GradientCumulativeFp16OptimizerHook',
+    cumulative_iters=4,  # 每 4 个 iter 更新一次参数
+    grad_clip=dict(max_norm=10, norm_type=2),
 )
 
 # ── 学习率调度 ──
