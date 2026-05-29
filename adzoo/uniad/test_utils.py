@@ -53,9 +53,20 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     """
     model.eval()
 
+    # Detect LoRA training stage for stage-aware evaluation
+    inner = model.module if hasattr(model, 'module') else model
+    _lora_stage = None
+    if hasattr(inner, 'coupled_lora') and inner.coupled_lora is not None:
+        _lora_stage = inner.coupled_lora.get_current_stage()
+
     # Occ eval init
-    eval_occ = hasattr(model.module, 'with_occ_head') \
-                and model.module.with_occ_head
+    #   stage=None (non-LoRA, or no coupled_lora): always eval
+    #   stage=1: OccHead LoRA only → eval occ
+    #   stage=2: PlanningHead LoRA only → skip occ
+    #   stage=3: Joint → eval occ
+    eval_occ = hasattr(inner, 'with_occ_head') \
+                and inner.with_occ_head \
+                and (_lora_stage is None or _lora_stage in (1, 3))
     if eval_occ:
         # 30mx30m, 100mx100m at 50cm resolution
         EVALUATION_RANGES = {'30x30': (70, 130),
@@ -67,10 +78,15 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
         panoptic_metrics = {}
         for key in EVALUATION_RANGES.keys():
             panoptic_metrics[key] = PanopticMetric(n_classes=n_classes, temporally_consistent=True).cuda()
-    
+
     # Plan eval init
-    eval_planning =  hasattr(model.module, 'with_planning_head') \
-                      and model.module.with_planning_head
+    #   stage=None: always eval
+    #   stage=1: OccHead LoRA only → skip planning
+    #   stage=2: PlanningHead LoRA only → eval planning
+    #   stage=3: Joint → eval planning
+    eval_planning =  hasattr(inner, 'with_planning_head') \
+                      and inner.with_planning_head \
+                      and (_lora_stage is None or _lora_stage in (2, 3))
     if eval_planning:
         planning_metrics = UniADPlanningMetric().cuda()
         
@@ -81,6 +97,10 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     if rank == 0:
         prog_bar = ProgressBar(len(dataset))
     time.sleep(2)  # This line can prevent deadlock problem in some cases.
+    # MultiScaleFlipAug3D wraps values in a list; unwrap if needed
+    def _unwrap(x):
+        return x[0] if isinstance(x, (list, tuple)) else x
+
     have_mask = False
     num_occ = 0
     for i, data in enumerate(data_loader):
@@ -89,17 +109,18 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
 
 
             #import pdb;pdb.set_trace()
-            
+
             # # EVAL planning
             if eval_planning:
                 # TODO: Wrap below into a func
-                segmentation = result[0]['planning']['planning_gt']['segmentation']
-                sdc_planning = result[0]['planning']['planning_gt']['sdc_planning']
-                sdc_planning_mask = result[0]['planning']['planning_gt']['sdc_planning_mask']
-                pred_sdc_traj = result[0]['planning']['result_planning']['sdc_traj']
-                result[0]['planning_traj'] = result[0]['planning']['result_planning']['sdc_traj']
-                result[0]['planning_traj_gt'] = result[0]['planning']['planning_gt']['sdc_planning']
-                result[0]['command'] = result[0]['planning']['planning_gt']['command']
+                segmentation = _unwrap(result[0]['planning']['planning_gt']['segmentation'])
+                sdc_planning = _unwrap(result[0]['planning']['planning_gt']['sdc_planning'])
+                sdc_planning_mask = _unwrap(result[0]['planning']['planning_gt']['sdc_planning_mask'])
+                pred_sdc_traj = _unwrap(result[0]['planning']['result_planning']['sdc_traj'])
+                result[0]['planning_traj'] = pred_sdc_traj
+                result[0]['planning_traj_gt'] = sdc_planning
+                result[0]['command'] = _unwrap(result[0]['planning']['planning_gt']['command'])
+
                 planning_metrics(pred_sdc_traj[:, :6, :2], sdc_planning[:, 0, :6, :2], sdc_planning_mask[:, 0, :6, :2], segmentation[:, 1:7])
 
             # # Eval Occ
