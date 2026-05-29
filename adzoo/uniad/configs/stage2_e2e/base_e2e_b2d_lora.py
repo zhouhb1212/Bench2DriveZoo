@@ -39,8 +39,8 @@ model = dict(
 # ── 优化器（仅 LoRA 参数 requires_grad=True，其余已冻结）──
 optimizer = dict(
     type="AdamW",
-    lr=3e-4,      # 梯度累积 4 步 → 等效 batch=4，按线性缩放 lr（2e-4 × 2）
-    weight_decay=0.05,  # 增大正则化，防止 LoRA 参数过大振荡
+    lr=1e-4,      # 累积 2 步等效 batch=2，按线性缩放 lr（2e-4 × 2/4 = 1e-4）
+    weight_decay=0.1,  # 增大 weight_decay 鼓励 flatter minima，降低 sharp minimum 附近的梯度曲率
 )
 
 # Stage 3 联合训练时，部分 LoRA 参数通过不同梯度路径参与 loss 计算，
@@ -82,20 +82,21 @@ log_config = dict(
 )
 
 # ── AMP 混合精度 + 梯度累积 ──
-# 累积 4 个 batch 的梯度再更新，等效 batch_size=4
-# 减少因单场景梯度噪声导致的严重震荡（理论方差降为 1/4）
+# 累积 2 步（非 4 步）：增大更新频率让优化器能及时纠正振荡方向，
+# 避免连续多步高梯度累加后单次大更新冲过头
 optimizer_config = dict(
     type='GradientCumulativeFp16OptimizerHook',
-    cumulative_iters=4,  # 每 4 个 iter 更新一次参数
-    grad_clip=dict(max_norm=10, norm_type=2),
+    cumulative_iters=2,  # 每 2 个 iter 更新一次参数（更新频率翻倍）
+    grad_clip=dict(max_norm=2.0, norm_type=2),  # LoRA 稳定 grad_norm ~0.8-1.1，2.0 过滤异常梯度
 )
 
-# ── 学习率调度 ──
+# ── 学习率调度（每 epoch 独立 warmup + cosine）──
+# 每个 epoch 重新 warmup 并衰减，epoch 2 以低 lr 起步避免梯度爆炸
 lr_config = dict(
-    by_epoch=False,
+    by_epoch=True,                # 每 epoch 独立调度
     policy="CosineAnnealing",
     warmup="linear",
-    warmup_iters=500,   # warmup 步数
-    warmup_ratio=1.0 / 3,
-    min_lr_ratio=1e-2,  # 最终 lr 衰减到 peak 的 1%，确保后期稳定收敛
+    warmup_iters=200,             # 每 epoch 前 200 iter warmup
+    warmup_ratio=0.1,             # 从 0.1*peak 起步（1e-5），给优化器时间适应新 epoch 的数据顺序
+    min_lr_ratio=1e-2,            # 最终 lr 衰减到 peak 的 1%（1e-6）
 )
