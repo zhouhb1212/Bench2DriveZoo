@@ -137,6 +137,7 @@ dmypy.json
 
 # output & ckpts
 output/
+logs/
 test/
 ckpts/
 ckpts

@@ -13,6 +13,7 @@ def main():
     args = parser.parse_args()
 
     cfg = Config.fromfile(args.config)
+    cfg.data.test.pop('samples_per_gpu', None)
     cfg.data.test.test_mode = True
     dataset = build_dataset(cfg.data.test, dict(test_mode=True))
 

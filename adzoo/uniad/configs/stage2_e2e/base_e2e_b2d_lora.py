@@ -19,8 +19,8 @@ load_from = "ckpts/uniad_base_b2d.pth"
 # ── Occupancy-Planning Coupled LoRA 配置 ──
 model = dict(
     coupled_lora_cfg=dict(
-        r=8,
-        alpha=8,       # scale = alpha/r = 1，降低 LoRA 输出放大系数，减少对预训练特征的扰动
+        r=16,
+        alpha=16,       # scale = alpha/r = 1，降低 LoRA 输出放大系数，减少对预训练特征的扰动
         dropout=0.05,  # 降低 dropout，减少随机性带来的梯度噪声
         pretrained_path="ckpts/uniad_base_b2d.pth",
         training_stage=1,  # 切换阶段：1 / 2 / 3

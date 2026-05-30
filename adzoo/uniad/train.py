@@ -232,7 +232,7 @@ def main():
         shuffler_sampler=cfg.data.shuffler_sampler,  # dict(type='DistributedGroupSampler'),
         nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
     )
-    eval_cfg = cfg.get('evaluation', {})
+    eval_cfg = cfg.get('evaluation', {}).copy()  # 浅拷贝避免修改原始 cfg
     eval_cfg.setdefault('by_epoch', cfg.runner['type'] != 'IterBasedRunner')
     # 验证结果保存到 work_dir/val/<timestamp>/ 下，使用绝对路径避免 cwd 依赖
     eval_cfg['jsonfile_prefix'] = osp.join(

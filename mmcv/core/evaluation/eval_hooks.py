@@ -1,5 +1,6 @@
 import bisect
 import os.path as osp
+import traceback
 
 import torch.distributed as dist
 from mmcv.runner import DistEvalHook as BaseDistEvalHook
@@ -12,52 +13,69 @@ class EvalHook(BaseEvalHook):
 
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
-        if not self._should_evaluate(runner):
-            return
+        try:
+            if not self._should_evaluate(runner):
+                return
 
-        results = self.test_fn(runner.model, self.dataloader, show=False)
-        runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
-        key_score = self.evaluate(runner, results)
-        if self.save_best:
-            self._save_ckpt(runner, key_score)
+            results = self.test_fn(runner.model, self.dataloader, show=False)
+            runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
+            key_score = self.evaluate(runner, results)
+            if self.save_best:
+                self._save_ckpt(runner, key_score)
+        except Exception:
+            runner.logger.error(
+                f'[Validation] Error at epoch {runner.epoch + 1}:\n'
+                f'{traceback.format_exc()}')
+            runner.logger.warning(
+                '[Validation] Validation failed, skipping and continuing '
+                'training...')
 
 
 class DistEvalHook(BaseDistEvalHook):
 
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
-        # Synchronization of BatchNorm's buffer (running_mean
-        # and running_var) is not supported in the DDP of pytorch,
-        # which may cause the inconsistent performance of models in
-        # different ranks, so we broadcast BatchNorm's buffers
-        # of rank 0 to other ranks to avoid this.
-        if self.broadcast_bn_buffer:
-            model = runner.model
-            for name, module in model.named_modules():
-                if isinstance(module,
-                              _BatchNorm) and module.track_running_stats:
-                    dist.broadcast(module.running_var, 0)
-                    dist.broadcast(module.running_mean, 0)
+        try:
+            # Synchronization of BatchNorm's buffer (running_mean
+            # and running_var) is not supported in the DDP of pytorch,
+            # which may cause the inconsistent performance of models in
+            # different ranks, so we broadcast BatchNorm's buffers
+            # of rank 0 to other ranks to avoid this.
+            if self.broadcast_bn_buffer:
+                model = runner.model
+                for name, module in model.named_modules():
+                    if isinstance(module,
+                                  _BatchNorm) and module.track_running_stats:
+                        dist.broadcast(module.running_var, 0)
+                        dist.broadcast(module.running_mean, 0)
 
-        if not self._should_evaluate(runner):
-            return
+            if not self._should_evaluate(runner):
+                return
 
-        tmpdir = self.tmpdir
-        if tmpdir is None:
-            tmpdir = osp.join(runner.work_dir, '.eval_hook')
+            tmpdir = self.tmpdir
+            if tmpdir is None:
+                tmpdir = osp.join(runner.work_dir, '.eval_hook')
 
-        results = self.test_fn(
-            runner.model,
-            self.dataloader,
-            tmpdir=tmpdir,
-            gpu_collect=self.gpu_collect)
-        if runner.rank == 0:
-            print('\n')
-            runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
-            key_score = self.evaluate(runner, results)
+            results = self.test_fn(
+                runner.model,
+                self.dataloader,
+                tmpdir=tmpdir,
+                gpu_collect=self.gpu_collect)
+            if runner.rank == 0:
+                print('\n')
+                runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
+                key_score = self.evaluate(runner, results)
 
-            if self.save_best:
-                self._save_ckpt(runner, key_score)
+                if self.save_best:
+                    self._save_ckpt(runner, key_score)
+        except Exception:
+            if runner.rank == 0:
+                runner.logger.error(
+                    f'[Validation] Error at epoch {runner.epoch + 1}:\n'
+                    f'{traceback.format_exc()}')
+                runner.logger.warning(
+                    '[Validation] Validation failed, skipping and continuing '
+                    'training...')
                 
 def _calc_dynamic_intervals(start_interval, dynamic_interval_list):
     assert is_list_of(dynamic_interval_list, tuple)
@@ -98,36 +116,45 @@ class CustomDistEvalHook(BaseDistEvalHook):
 
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
-        # Synchronization of BatchNorm's buffer (running_mean
-        # and running_var) is not supported in the DDP of pytorch,
-        # which may cause the inconsistent performance of models in
-        # different ranks, so we broadcast BatchNorm's buffers
-        # of rank 0 to other ranks to avoid this.
-        if self.broadcast_bn_buffer:
-            model = runner.model
-            for name, module in model.named_modules():
-                if isinstance(module,
-                              _BatchNorm) and module.track_running_stats:
-                    dist.broadcast(module.running_var, 0)
-                    dist.broadcast(module.running_mean, 0)
+        try:
+            # Synchronization of BatchNorm's buffer (running_mean
+            # and running_var) is not supported in the DDP of pytorch,
+            # which may cause the inconsistent performance of models in
+            # different ranks, so we broadcast BatchNorm's buffers
+            # of rank 0 to other ranks to avoid this.
+            if self.broadcast_bn_buffer:
+                model = runner.model
+                for name, module in model.named_modules():
+                    if isinstance(module,
+                                  _BatchNorm) and module.track_running_stats:
+                        dist.broadcast(module.running_var, 0)
+                        dist.broadcast(module.running_mean, 0)
 
-        if not self._should_evaluate(runner):
-            return
+            if not self._should_evaluate(runner):
+                return
 
-        tmpdir = self.tmpdir
-        if tmpdir is None:
-            tmpdir = osp.join(runner.work_dir, '.eval_hook')
+            tmpdir = self.tmpdir
+            if tmpdir is None:
+                tmpdir = osp.join(runner.work_dir, '.eval_hook')
 
-        results = self.test_fn(
-            runner.model,
-            self.dataloader,
-            tmpdir=tmpdir,
-            gpu_collect=self.gpu_collect)
-        if runner.rank == 0:
-            print('\n')
-            runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
+            results = self.test_fn(
+                runner.model,
+                self.dataloader,
+                tmpdir=tmpdir,
+                gpu_collect=self.gpu_collect)
+            if runner.rank == 0:
+                print('\n')
+                runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
 
-            key_score = self.evaluate(runner, results)
+                key_score = self.evaluate(runner, results)
 
-            if self.save_best:
-                self._save_ckpt(runner, key_score)
+                if self.save_best:
+                    self._save_ckpt(runner, key_score)
+        except Exception:
+            if runner.rank == 0:
+                runner.logger.error(
+                    f'[Validation] Error at epoch {runner.epoch + 1}:\n'
+                    f'{traceback.format_exc()}')
+                runner.logger.warning(
+                    '[Validation] Validation failed, skipping and continuing '
+                    'training...')
