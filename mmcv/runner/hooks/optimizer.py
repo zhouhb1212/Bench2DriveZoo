@@ -95,9 +95,10 @@ class GradientCumulativeOptimizerHook(OptimizerHook):
 
         residual_iters = runner.max_iters - runner.iter
 
-        self.divisible_iters = (
+        self.divisible_iters = runner.iter + (
             residual_iters // self.cumulative_iters * self.cumulative_iters)
-        self.remainder_iters = residual_iters - self.divisible_iters
+        self.remainder_iters = residual_iters - (
+            self.divisible_iters - runner.iter)
 
         self.initialized = True
 
