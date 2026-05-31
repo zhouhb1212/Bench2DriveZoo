@@ -1,12 +1,36 @@
 import bisect
+import gc
+import os
 import os.path as osp
 import traceback
 
+import torch
 import torch.distributed as dist
 from mmcv.runner import DistEvalHook as BaseDistEvalHook
 from mmcv.runner import EvalHook as BaseEvalHook
 from mmcv.utils import is_list_of
 from torch.nn.modules.batchnorm import _BatchNorm
+
+
+def _cleanup_memory(runner=None):
+    """Release GPU and CPU memory before/after validation."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def _check_gpu_memory(min_free_gb=4):
+    """Check if there's enough free GPU memory for validation.
+
+    Returns (ok: bool, free_gb: float, total_gb: float).
+    """
+    if not torch.cuda.is_available():
+        return True, float('inf'), float('inf')
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    free_gb = free_mem / (1024 ** 3)
+    total_gb = total_mem / (1024 ** 3)
+    return free_gb >= min_free_gb, free_gb, total_gb
 
 
 class EvalHook(BaseEvalHook):
@@ -17,12 +41,14 @@ class EvalHook(BaseEvalHook):
             if not self._should_evaluate(runner):
                 return
 
+            _cleanup_memory()
             results = self.test_fn(runner.model, self.dataloader, show=False)
             runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
             key_score = self.evaluate(runner, results)
             if self.save_best:
                 self._save_ckpt(runner, key_score)
         except Exception:
+            _cleanup_memory()
             runner.logger.error(
                 f'[Validation] Error at epoch {runner.epoch + 1}:\n'
                 f'{traceback.format_exc()}')
@@ -52,6 +78,7 @@ class DistEvalHook(BaseDistEvalHook):
             if not self._should_evaluate(runner):
                 return
 
+            _cleanup_memory()
             tmpdir = self.tmpdir
             if tmpdir is None:
                 tmpdir = osp.join(runner.work_dir, '.eval_hook')
@@ -61,6 +88,7 @@ class DistEvalHook(BaseDistEvalHook):
                 self.dataloader,
                 tmpdir=tmpdir,
                 gpu_collect=self.gpu_collect)
+            _cleanup_memory()
             if runner.rank == 0:
                 print('\n')
                 runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
@@ -69,6 +97,7 @@ class DistEvalHook(BaseDistEvalHook):
                 if self.save_best:
                     self._save_ckpt(runner, key_score)
         except Exception:
+            _cleanup_memory()
             if runner.rank == 0:
                 runner.logger.error(
                     f'[Validation] Error at epoch {runner.epoch + 1}:\n'
@@ -133,6 +162,22 @@ class CustomDistEvalHook(BaseDistEvalHook):
             if not self._should_evaluate(runner):
                 return
 
+            # ── 验证前内存保护 ──
+            _cleanup_memory()
+
+            # 显存预检查：空闲显存不足 4GB 时跳过验证，避免 OOM → SIGKILL
+            min_free_gb = float(
+                os.environ.get('B2D_EVAL_MIN_FREE_GPU_GB', '4'))
+            ok, free_gb, total_gb = _check_gpu_memory(min_free_gb)
+            if not ok:
+                if runner.rank == 0:
+                    runner.logger.warning(
+                        f'[Validation] Low GPU memory '
+                        f'({free_gb:.1f}GB free / {total_gb:.1f}GB total, '
+                        f'need {min_free_gb:.0f}GB), '
+                        f'skipping validation at epoch {runner.epoch + 1}')
+                return
+
             tmpdir = self.tmpdir
             if tmpdir is None:
                 tmpdir = osp.join(runner.work_dir, '.eval_hook')
@@ -142,6 +187,10 @@ class CustomDistEvalHook(BaseDistEvalHook):
                 self.dataloader,
                 tmpdir=tmpdir,
                 gpu_collect=self.gpu_collect)
+
+            # 验证后再次释放内存，清理 test_fn 残留
+            _cleanup_memory()
+
             if runner.rank == 0:
                 print('\n')
                 runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
@@ -151,6 +200,8 @@ class CustomDistEvalHook(BaseDistEvalHook):
                 if self.save_best:
                     self._save_ckpt(runner, key_score)
         except Exception:
+            # 验证后清理，避免残留 tensor 影响下一 epoch
+            _cleanup_memory()
             if runner.rank == 0:
                 runner.logger.error(
                     f'[Validation] Error at epoch {runner.epoch + 1}:\n'

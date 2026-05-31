@@ -162,6 +162,9 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
                 batch_size = len(result)
                 bbox_results.extend(result)
 
+        # 周期性释放 GPU 缓存，防止碎片化导致 OOM
+        if i % 100 == 0 and i > 0:
+            torch.cuda.empty_cache()
 
         if rank == 0:
             for _ in range(batch_size * world_size):
