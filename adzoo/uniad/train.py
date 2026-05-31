@@ -68,6 +68,9 @@ def parse_args():
         '--lr',
         type=float,
         help='override optimizer lr (e.g. 1e-3, 5e-4)')
+    parser.add_argument(
+        '--load-from',
+        help='override cfg.load_from (weight-only, no optimizer state)')
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -107,6 +110,8 @@ def main():
         cfg.model['coupled_lora_cfg']['training_stage'] = args.training_stage
     if args.lr is not None:
         cfg.optimizer['lr'] = args.lr
+    if args.load_from is not None:
+        cfg.load_from = args.load_from
 
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':
