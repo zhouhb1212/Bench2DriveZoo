@@ -215,31 +215,34 @@ def main():
             runner.register_hook(DistSamplerSeedHook())
     
     # Register eval hooks for interval eval
-    val_samples_per_gpu = cfg.data.val.pop('samples_per_gpu', 1)
-    if val_samples_per_gpu > 1:
-        assert False
-        # Replace 'ImageToTensor' to 'DefaultFormatBundle'
-        cfg.data.val.pipeline = replace_ImageToTensor(
-            cfg.data.val.pipeline)
-    val_dataset = build_dataset(cfg.data.val, dict(test_mode=True))
+    if not args.no_validate:
+        val_samples_per_gpu = cfg.data.val.pop('samples_per_gpu', 1)
+        if val_samples_per_gpu > 1:
+            assert False
+            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
+            cfg.data.val.pipeline = replace_ImageToTensor(
+                cfg.data.val.pipeline)
+        val_dataset = build_dataset(cfg.data.val, dict(test_mode=True))
 
-    val_dataloader = build_dataloader(
-        val_dataset,
-        samples_per_gpu=val_samples_per_gpu,
-        workers_per_gpu=cfg.data.workers_per_gpu,
-        dist=distributed,
-        shuffle=False,
-        shuffler_sampler=cfg.data.shuffler_sampler,  # dict(type='DistributedGroupSampler'),
-        nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
-    )
-    eval_cfg = cfg.get('evaluation', {}).copy()  # 浅拷贝避免修改原始 cfg
-    eval_cfg.setdefault('by_epoch', cfg.runner['type'] != 'IterBasedRunner')
-    # 验证结果保存到 work_dir/val/<timestamp>/ 下，使用绝对路径避免 cwd 依赖
-    eval_cfg['jsonfile_prefix'] = osp.join(
-        osp.abspath(cfg.work_dir), 'val',
-        time.strftime('%Y%m%d_%H%M%S', time.localtime()))
-    eval_hook = CustomDistEvalHook if distributed else EvalHook
-    runner.register_hook(eval_hook(val_dataloader, test_fn=custom_multi_gpu_test, **eval_cfg))
+        val_dataloader = build_dataloader(
+            val_dataset,
+            samples_per_gpu=val_samples_per_gpu,
+            workers_per_gpu=cfg.data.workers_per_gpu,
+            dist=distributed,
+            shuffle=False,
+            shuffler_sampler=cfg.data.shuffler_sampler,  # dict(type='DistributedGroupSampler'),
+            nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
+        )
+        eval_cfg = cfg.get('evaluation', {}).copy()  # 浅拷贝避免修改原始 cfg
+        eval_cfg.setdefault('by_epoch', cfg.runner['type'] != 'IterBasedRunner')
+        # 验证结果保存到 work_dir/val/<timestamp>/ 下，使用绝对路径避免 cwd 依赖
+        eval_cfg['jsonfile_prefix'] = osp.join(
+            osp.abspath(cfg.work_dir), 'val',
+            time.strftime('%Y%m%d_%H%M%S', time.localtime()))
+        eval_hook = CustomDistEvalHook if distributed else EvalHook
+        runner.register_hook(eval_hook(val_dataloader, test_fn=custom_multi_gpu_test, **eval_cfg))
+    else:
+        logger.info('Validation disabled via --no-validate flag')
 
     if cfg.resume_from and os.path.exists(cfg.resume_from):
         runner.resume(cfg.resume_from)
