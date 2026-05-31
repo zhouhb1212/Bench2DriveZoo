@@ -255,6 +255,8 @@ def main():
                 f'[Load-Only] Loading weights + epoch/iter from {cfg.load_from} '
                 f'(optimizer fresh)')
             runner.resume(cfg.load_from, resume_optimizer=False)
+            # 清除 checkpoint meta 中残留的 AMP scaler 状态，防止污染
+            runner.meta.pop('fp16', None)
         else:
             runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
