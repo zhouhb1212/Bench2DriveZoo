@@ -249,7 +249,14 @@ def main():
     if cfg.resume_from and os.path.exists(cfg.resume_from):
         runner.resume(cfg.resume_from)
     elif cfg.load_from:
-        runner.load_checkpoint(cfg.load_from)
+        # --load-from 覆盖的权重：恢复 epoch/iter 但不恢复 optimizer，避免 AMP 污染
+        if args.load_from is not None:
+            runner.logger.info(
+                f'[Load-Only] Loading weights + epoch/iter from {cfg.load_from} '
+                f'(optimizer fresh)')
+            runner.resume(cfg.load_from, resume_optimizer=False)
+        else:
+            runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
 
 if __name__ == '__main__':
