@@ -815,6 +815,31 @@ class B2D_E2E_Dataset(Custom3DDataset):
                     planning_tab.add_row(row_value)
                 print(planning_tab)
 
+        if 'occ_results_computed' in results.keys():
+            occ_results_computed = results['occ_results_computed']
+            occ_tab = PrettyTable()
+            occ_tab.field_names = ["Occ Metric", "30x30 (m)", "100x100 (m)"]
+            metric_names = ['iou', 'pq', 'sq', 'rq']
+            for key in metric_names:
+                if key in occ_results_computed:
+                    value = occ_results_computed[key]
+                    row = [key.upper()]
+                    for i in range(len(value)):
+                        row.append('%.2f' % float(value[i]))
+                    occ_tab.add_row(row)
+            print(occ_tab)
+            print(f"Occ eval frames: {occ_results_computed.get('num_occ', 'N/A')}, "
+                  f"ratio: {occ_results_computed.get('ratio_occ', 0):.2%}")
+            # Write occ metrics into detail dict for logging
+            for key in metric_names:
+                if key in occ_results_computed:
+                    value = occ_results_computed[key]
+                    if len(value) >= 1:
+                        detail[f'occ/{key}_30x30'] = float(value[0])
+                    if len(value) >= 2:
+                        detail[f'occ/{key}_100x100'] = float(value[1])
+            detail['occ/num_frames'] = occ_results_computed.get('num_occ', 0)
+            detail['occ/ratio'] = occ_results_computed.get('ratio_occ', 0)
 
         return detail
 

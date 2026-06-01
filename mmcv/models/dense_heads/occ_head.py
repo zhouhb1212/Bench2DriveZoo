@@ -60,6 +60,9 @@ class OccHead(BaseModule):
                  pan_eval=False,
                  test_seg_thresh:float=0.5,
                  test_with_track_score=False,
+
+                 # Control: whether to compute auxiliary (intermediate) loss
+                 compute_aux_loss=True,
                  ):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
             'behavior, init_cfg is not allowed to be set'
@@ -163,6 +166,7 @@ class OccHead(BaseModule):
         self.test_seg_thresh  = test_seg_thresh
 
         self.test_with_track_score = test_with_track_score
+        self.compute_aux_loss = compute_aux_loss
         self.init_weights()
 
     def init_weights(self):
@@ -186,12 +190,15 @@ class OccHead(BaseModule):
         attn_mask[torch.where(
             attn_mask.sum(-1) == attn_mask.shape[-1])] = False
 
-        upsampled_mask_pred = F.interpolate(
-            mask_pred,
-            self.bev_size,
-            mode='bilinear',
-            align_corners=False
-        )  # Supervised by gt
+        if self.compute_aux_loss:
+            upsampled_mask_pred = F.interpolate(
+                mask_pred,
+                self.bev_size,
+                mode='bilinear',
+                align_corners=False
+            )  # Supervised by gt
+        else:
+            upsampled_mask_pred = None
 
         return attn_mask, upsampled_mask_pred, ins_embed
 
@@ -223,9 +230,10 @@ class OccHead(BaseModule):
 
             # Generate attn mask 
             attn_mask, mask_pred, cur_ins_emb_for_mask_attn = self.get_attn_mask(cur_state, cur_ins_query)
-            attn_masks = [None, attn_mask] 
+            attn_masks = [None, attn_mask]
 
-            mask_preds.append(mask_pred)  # /1
+            if self.compute_aux_loss:
+                mask_preds.append(mask_pred)  # /1
             temporal_embed_for_mask_attn.append(cur_ins_emb_for_mask_attn)
 
             cur_state = rearrange(cur_state, 'b c h w -> (h w) b c')
@@ -256,7 +264,10 @@ class OccHead(BaseModule):
 
         future_states = torch.stack(future_states, dim=1)  # [b, t, d, h/4, w/4]
         temporal_query = torch.stack(temporal_query, dim=1)  # [b, t, q, d]
-        mask_preds = torch.stack(mask_preds, dim=2)  # [b, q, t, h, w]
+        if self.compute_aux_loss:
+            mask_preds = torch.stack(mask_preds, dim=2)  # [b, q, t, h, w]
+        else:
+            mask_preds = None
         ins_query = torch.stack(temporal_embed_for_mask_attn, dim=1)  # [b, t, q, d]
 
         # Decode future states to larger resolution
@@ -344,7 +355,8 @@ class OccHead(BaseModule):
             # Prediction
             ins_seg_preds = ins_seg_preds_batch[ind]   # [q(n_gt for matched), t, h, w]
             ins_seg_targets = ins_seg_targets_batch[ind]  # [t, h, w]
-            mask_preds = mask_preds_batch[ind]
+            if self.compute_aux_loss:
+                mask_preds = mask_preds_batch[ind]
             
             # Assigned-gt
             ins_seg_targets_ordered = []
@@ -386,22 +398,25 @@ class OccHead(BaseModule):
                 ins_seg_preds, ins_seg_targets_ordered, frame_mask=frame_mask
             )
 
-            cur_aux_dice_loss = self.loss_dice(
-                mask_preds, ins_seg_targets_ordered, avg_factor=num_total_pos, frame_mask=frame_mask
-            )
-            cur_aux_mask_loss = self.loss_mask(
-                mask_preds, ins_seg_targets_ordered, frame_mask=frame_mask
-            )
+            if self.compute_aux_loss:
+                cur_aux_dice_loss = self.loss_dice(
+                    mask_preds, ins_seg_targets_ordered, avg_factor=num_total_pos, frame_mask=frame_mask
+                )
+                cur_aux_mask_loss = self.loss_mask(
+                    mask_preds, ins_seg_targets_ordered, frame_mask=frame_mask
+                )
 
             loss_dice += cur_dice_loss
             loss_mask += cur_mask_loss
-            loss_aux_dice += cur_aux_dice_loss * self.aux_loss_weight
-            loss_aux_mask += cur_aux_mask_loss * self.aux_loss_weight
+            if self.compute_aux_loss:
+                loss_aux_dice += cur_aux_dice_loss * self.aux_loss_weight
+                loss_aux_mask += cur_aux_mask_loss * self.aux_loss_weight
 
         loss_dict['loss_dice'] = loss_dice / bs
         loss_dict['loss_mask'] = loss_mask / bs
-        loss_dict['loss_aux_dice'] = loss_aux_dice / bs
-        loss_dict['loss_aux_mask'] = loss_aux_mask / bs
+        if self.compute_aux_loss:
+            loss_dict['loss_aux_dice'] = loss_aux_dice / bs
+            loss_dict['loss_aux_mask'] = loss_aux_mask / bs
 
         return loss_dict
 

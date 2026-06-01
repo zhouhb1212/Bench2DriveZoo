@@ -1,8 +1,8 @@
 # ---------------------------------------------------------------------------------#
 # Occupancy-Planning Coupled LoRA (双 LoRA 微调)
 #
-# 仅在 OccHead Transformer Decoder 和 PlanningHeadSingleMode adapter 路径中
-# 注入 LoRA，通过三阶段训练对 OccHead 和 PlanningHead 进行局部微调。
+# 在 OccHead Transformer Decoder + query_to_occ_feat MLP 和 PlanningHeadSingleMode
+# adapter 路径中注入 LoRA，通过三阶段训练对 OccHead 和 PlanningHead 进行局部微调。
 # ---------------------------------------------------------------------------------#
 
 import torch.nn as nn
@@ -68,12 +68,15 @@ class OccPlanCoupledLoRA:
 
     def _inject_occ_head(self):
         """
-        向 OccHead 的 DetrTransformerDecoder 每层注入 LoRA。
+        向 OccHead 注入 LoRA。
 
-        每层注入目标:
-            - self_attn.attn  →  LoRAMultiheadAttention  (Q/K/V/Out proj)
-            - cross_attn.attn →  LoRAMultiheadAttention  (Q/K/V/Out proj)
-            - FFN: layers[0][0] (w1) & layers[1] (w2) → LoRALinear
+        注入目标:
+            - Transformer Decoder 每层:
+                self_attn.attn  →  LoRAMultiheadAttention  (Q/K/V/Out proj)
+                cross_attn.attn →  LoRAMultiheadAttention  (Q/K/V/Out proj)
+                FFN: layers[0][0] (w1) & layers[1] (w2) → LoRALinear
+            - query_to_occ_feat MLP (instance query → occupancy feature 的门户):
+                layers[0..2] → LoRALinear
         """
         r, alpha, dropout = self.r, self.alpha, self.dropout
         decoder = self.occ_head.transformer_decoder  # DetrTransformerDecoder
@@ -97,6 +100,18 @@ class OccPlanCoupledLoRA:
                         old_w2 = ffn.layers[1]
                         ffn.layers[1] = inject_lora_to_linear(
                             old_w2, r=r, alpha=alpha, dropout=dropout)
+
+        # Inject LoRA into query_to_occ_feat (MLP: instance query → occ feature space)
+        # This is the final bottleneck before occupancy logits — giving it LoRA
+        # provides a direct gradient path from loss to trainable parameters,
+        # bypassing the transformer decoder for stronger and more stable signal.
+        if hasattr(self.occ_head, 'query_to_occ_feat'):
+            q2o = self.occ_head.query_to_occ_feat
+            if hasattr(q2o, 'layers'):
+                for i in range(len(q2o.layers)):
+                    old_lin = q2o.layers[i]
+                    q2o.layers[i] = inject_lora_to_linear(
+                        old_lin, r=r, alpha=alpha, dropout=dropout)
 
     def _inject_planning_head(self):
         """

@@ -18,10 +18,15 @@ load_from = "ckpts/uniad_base_b2d.pth"
 
 # ── Occupancy-Planning Coupled LoRA 配置 ──
 model = dict(
+    # 关闭 OccHead aux loss 计算：aux 输出在 Transformer Decoder 之前，
+    # LoRA 注入在 Decoder 内部，aux loss 无法获得有效梯度，仅为无用计算
+    occ_head=dict(
+        compute_aux_loss=False,
+    ),
     coupled_lora_cfg=dict(
-        r=16,
-        alpha=16,       # scale = alpha/r = 1，降低 LoRA 输出放大系数，减少对预训练特征的扰动
-        dropout=0.05,  # 降低 dropout，减少随机性带来的梯度噪声
+        r=8,
+        alpha=8,        # scale = alpha/r = 1
+        dropout=0.05,
         pretrained_path="ckpts/uniad_base_b2d.pth",
         training_stage=1,  # 切换阶段：1 / 2 / 3
     ),
@@ -90,13 +95,14 @@ optimizer_config = dict(
     grad_clip=dict(max_norm=2.0, norm_type=2),  # LoRA 稳定 grad_norm ~0.8-1.1，2.0 过滤异常梯度
 )
 
-# ── 学习率调度（每 epoch 独立 warmup + cosine）──
-# 每个 epoch 重新 warmup 并衰减，epoch 2 以低 lr 起步避免梯度爆炸
+# ── 学习率调度（全局 cosine，跨 epoch 连续）──
+# by_epoch=False: 整个训练周期为一次 cosine 衰减，消除 epoch 边界 lr 跳变
+# 仅训练开始执行一次 warmup（前 200 iter）
 lr_config = dict(
-    by_epoch=True,                # 每 epoch 独立调度
+    by_epoch=False,               # 全局连续调度，不每 epoch 重置
     policy="CosineAnnealing",
     warmup="linear",
-    warmup_iters=200,             # 每 epoch 前 200 iter warmup
-    warmup_ratio=0.1,             # 从 0.1*peak 起步（1e-5），给优化器时间适应新 epoch 的数据顺序
+    warmup_iters=200,             # 训练开始前 200 iter warmup
+    warmup_ratio=0.1,             # 从 0.1*peak 起步（1e-5）
     min_lr_ratio=1e-2,            # 最终 lr 衰减到 peak 的 1%（1e-6）
 )
