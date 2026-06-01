@@ -729,7 +729,8 @@ class B2D_E2E_Dataset(Custom3DDataset):
 
         # NOTE:Curremtly we only support evaluation on detection and planning 
 
-        result_files, tmp_dir = self.format_results(results['bbox_results'], jsonfile_prefix)    
+        result_files, tmp_dir = self.format_results(results['bbox_results'], jsonfile_prefix)
+        del results['bbox_results']  # free CPU memory before loading JSON
         result_path = result_files
         with open(result_path) as f:
             result_data = json.load(f)
@@ -884,52 +885,54 @@ class B2D_E2E_Dataset(Custom3DDataset):
         Returns:
             str: Path of the output json file.
         """
+        import json as _json
 
-
-        nusc_annos = {}
         mapped_class_names = self.CLASSES
-
-        print('Start to convert detection format...')
-        for sample_id, det in enumerate(track_iter_progress(results)):
-            #pdb.set_trace()
-            annos = []
-            box3d = det['boxes_3d']
-            scores = det['scores_3d']
-            labels = det['labels_3d']
-            box_gravity_center = box3d.gravity_center
-            box_dims = box3d.dims
-            box_yaw = box3d.yaw.numpy()
-            box_yaw = -box_yaw - np.pi / 2
-            sample_token = self.data_infos[sample_id]['folder'] + '_' + str(self.data_infos[sample_id]['frame_idx'])
-
-
-
-            for i in range(len(box3d)):
-                #import pdb;pdb.set_trace()
-                quat = list(Quaternion(axis=[0, 0, 1], radians=box_yaw[i]))
-                velocity = [box3d.tensor[i, 7].item(),box3d.tensor[i, 8].item()]
-                name = mapped_class_names[labels[i]]
-                nusc_anno = dict(
-                    sample_token=sample_token,
-                    translation=box_gravity_center[i].tolist(),
-                    size=box_dims[i].tolist(),
-                    rotation=quat,
-                    velocity=velocity,
-                    detection_name=name,
-                    detection_score=scores[i].item(),
-                    attribute_name=name)
-                annos.append(nusc_anno)
-            nusc_annos[sample_token] = annos
-        nusc_submissions = {
-            'meta': self.modality,
-            'results': nusc_annos,
-        }
-
         mkdir_or_exist(jsonfile_prefix)
         res_path = osp.join(jsonfile_prefix, 'results_nusc.json')
         print('Results writes to', res_path)
-        dump(nusc_submissions, res_path)
-        return res_path  
+
+        print('Start to convert detection format...')
+        with open(res_path, 'w') as f:
+            f.write('{"meta": ')
+            _json.dump(self.modality, f)
+            f.write(', "results": {')
+            first = True
+            for sample_id, det in enumerate(track_iter_progress(results)):
+                annos = []
+                box3d = det['boxes_3d']
+                scores = det['scores_3d']
+                labels = det['labels_3d']
+                box_gravity_center = box3d.gravity_center
+                box_dims = box3d.dims
+                box_yaw = box3d.yaw.numpy()
+                box_yaw = -box_yaw - np.pi / 2
+                sample_token = self.data_infos[sample_id]['folder'] + '_' + str(self.data_infos[sample_id]['frame_idx'])
+
+                for i in range(len(box3d)):
+                    quat = list(Quaternion(axis=[0, 0, 1], radians=box_yaw[i]))
+                    velocity = [box3d.tensor[i, 7].item(), box3d.tensor[i, 8].item()]
+                    name = mapped_class_names[labels[i]]
+                    nusc_anno = dict(
+                        sample_token=sample_token,
+                        translation=box_gravity_center[i].tolist(),
+                        size=box_dims[i].tolist(),
+                        rotation=quat,
+                        velocity=velocity,
+                        detection_name=name,
+                        detection_score=scores[i].item(),
+                        attribute_name=name)
+                    annos.append(nusc_anno)
+
+                if not first:
+                    f.write(', ')
+                _json.dump(sample_token, f)
+                f.write(': ')
+                _json.dump(annos, f)
+                first = False
+            f.write('}}')
+
+        return res_path
 
     def format_results(self, results, jsonfile_prefix=None):
         """Format the results to json (standard format for COCO evaluation).

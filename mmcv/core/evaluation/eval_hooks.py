@@ -21,16 +21,32 @@ def _cleanup_memory(runner=None):
 
 
 def _check_gpu_memory(min_free_gb=4):
-    """Check if there's enough free GPU memory for validation.
-
-    Returns (ok: bool, free_gb: float, total_gb: float).
-    """
     if not torch.cuda.is_available():
         return True, float('inf'), float('inf')
     free_mem, total_mem = torch.cuda.mem_get_info()
     free_gb = free_mem / (1024 ** 3)
     total_gb = total_mem / (1024 ** 3)
     return free_gb >= min_free_gb, free_gb, total_gb
+
+
+def _check_system_memory(min_free_gb=8):
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            meminfo = f.read()
+        import re
+        m = re.search(r'MemAvailable:\s+(\d+)\s+kB', meminfo)
+        if m is None:
+            m = re.search(r'MemFree:\s+(\d+)\s+kB', meminfo)
+        if m is None:
+            return True, float('inf'), float('inf')
+        free_kb = int(m.group(1))
+        m_total = re.search(r'MemTotal:\s+(\d+)\s+kB', meminfo)
+        total_kb = int(m_total.group(1)) if m_total else free_kb
+        free_gb = free_kb / (1024 * 1024)
+        total_gb = total_kb / (1024 * 1024)
+        return free_gb >= min_free_gb, free_gb, total_gb
+    except Exception:
+        return True, float('inf'), float('inf')
 
 
 class EvalHook(BaseEvalHook):
@@ -44,9 +60,19 @@ class EvalHook(BaseEvalHook):
             _cleanup_memory()
             results = self.test_fn(runner.model, self.dataloader, show=False)
             runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
-            key_score = self.evaluate(runner, results)
-            if self.save_best:
-                self._save_ckpt(runner, key_score)
+            min_free_ram_gb = float(
+                os.environ.get('B2D_EVAL_MIN_FREE_RAM_GB', '8'))
+            ram_ok, free_ram_gb, total_ram_gb = _check_system_memory(min_free_ram_gb)
+            if not ram_ok:
+                runner.logger.warning(
+                    f'[Validation] Low system RAM '
+                    f'({free_ram_gb:.1f}GB free / {total_ram_gb:.1f}GB total, '
+                    f'need {min_free_ram_gb:.0f}GB), '
+                    f'skipping metric computation at epoch {runner.epoch + 1}')
+            else:
+                key_score = self.evaluate(runner, results)
+                if self.save_best:
+                    self._save_ckpt(runner, key_score)
         except Exception:
             _cleanup_memory()
             runner.logger.error(
@@ -92,10 +118,20 @@ class DistEvalHook(BaseDistEvalHook):
             if runner.rank == 0:
                 print('\n')
                 runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
-                key_score = self.evaluate(runner, results)
 
-                if self.save_best:
-                    self._save_ckpt(runner, key_score)
+                min_free_ram_gb = float(
+                    os.environ.get('B2D_EVAL_MIN_FREE_RAM_GB', '8'))
+                ram_ok, free_ram_gb, total_ram_gb = _check_system_memory(min_free_ram_gb)
+                if not ram_ok:
+                    runner.logger.warning(
+                        f'[Validation] Low system RAM '
+                        f'({free_ram_gb:.1f}GB free / {total_ram_gb:.1f}GB total, '
+                        f'need {min_free_ram_gb:.0f}GB), '
+                        f'skipping metric computation at epoch {runner.epoch + 1}')
+                else:
+                    key_score = self.evaluate(runner, results)
+                    if self.save_best:
+                        self._save_ckpt(runner, key_score)
         except Exception:
             _cleanup_memory()
             if runner.rank == 0:
@@ -105,7 +141,7 @@ class DistEvalHook(BaseDistEvalHook):
                 runner.logger.warning(
                     '[Validation] Validation failed, skipping and continuing '
                     'training...')
-                
+
 def _calc_dynamic_intervals(start_interval, dynamic_interval_list):
     assert is_list_of(dynamic_interval_list, tuple)
 
@@ -195,12 +231,21 @@ class CustomDistEvalHook(BaseDistEvalHook):
                 print('\n')
                 runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
 
-                key_score = self.evaluate(runner, results)
+                min_free_ram_gb = float(
+                    os.environ.get('B2D_EVAL_MIN_FREE_RAM_GB', '8'))
+                ram_ok, free_ram_gb, total_ram_gb = _check_system_memory(min_free_ram_gb)
+                if not ram_ok:
+                    runner.logger.warning(
+                        f'[Validation] Low system RAM '
+                        f'({free_ram_gb:.1f}GB free / {total_ram_gb:.1f}GB total, '
+                        f'need {min_free_ram_gb:.0f}GB), '
+                        f'skipping metric computation at epoch {runner.epoch + 1}')
+                else:
+                    key_score = self.evaluate(runner, results)
 
-                if self.save_best:
-                    self._save_ckpt(runner, key_score)
+                    if self.save_best:
+                        self._save_ckpt(runner, key_score)
         except Exception:
-            # 验证后清理，避免残留 tensor 影响下一 epoch
             _cleanup_memory()
             if runner.rank == 0:
                 runner.logger.error(

@@ -209,15 +209,10 @@ class UniAD(UniADTrack):
                         and self.coupled_lora.get_current_stage() == 3)
 
         # 冻结 head（track/map/motion）用 no_grad 执行，节省显存和算力
-        # Stage 1: 仅 Occ LoRA 需要梯度 → track/motion 冻结
-        # Stage 2: 仅 Planning LoRA 需要梯度 → track/motion/occ 冻结
-        # Stage 3: Occ + Planning LoRA 需要梯度 → track/map/motion 冻结
-        if stage1_only:
-            frozen_heads_ctx = torch.no_grad()
-        elif stage2_only or stage3_joint:
-            frozen_heads_ctx = torch.no_grad()
-        else:
-            frozen_heads_ctx = contextlib.nullcontext()
+        # 所有 LoRA stage 均冻结这些 head；仅无 LoRA 时正常执行
+        frozen_heads_ctx = (
+            torch.no_grad() if self.coupled_lora is not None
+            else contextlib.nullcontext())
 
         if stage1_only:
             # 轻量级 BEV 特征提取（全程 no_grad，无 track decoder 计算）
@@ -275,23 +270,22 @@ class UniAD(UniADTrack):
             losses_motion = self.loss_weighted_and_prefixed(losses_motion, prefix='motion')
             monitoring_losses.update(losses_motion)
 
-        # Forward Occ Head（LoRA 可训练：Stage 1/3）
-        if self.with_occ_head:
+        # Forward Occ Head（LoRA 可训练：Stage 1/3；Stage 2 跳过：
+        # PlanningHead.forward_train 硬编码 occ_mask=None，不需要 Occ 特征）
+        if self.with_occ_head and not stage2_only:
             if outs_motion['track_query'].shape[1] == 0:# avoid 0 track
                 outs_motion['track_query'] = torch.zeros((1, 1, 256)).to(bev_embed)
                 outs_motion['track_query_pos'] = torch.zeros((1,1, 256)).to(bev_embed)
                 outs_motion['traj_query'] = torch.zeros((3, 1, 1, 6, 256)).to(bev_embed)
                 outs_motion['all_matched_idxes'] = [[-1]]
-            occ_ctx = torch.no_grad() if stage2_only else contextlib.nullcontext()
-            with occ_ctx:
-                losses_occ = self.occ_head.forward_train(
-                    bev_embed,
-                    outs_motion,
-                    gt_inds_list=gt_inds,
-                    gt_segmentation=gt_segmentation,
-                    gt_instance=gt_instance,
-                    gt_img_is_valid=gt_occ_img_is_valid,
-                )
+            losses_occ = self.occ_head.forward_train(
+                bev_embed,
+                outs_motion,
+                gt_inds_list=gt_inds,
+                gt_segmentation=gt_segmentation,
+                gt_instance=gt_instance,
+                gt_img_is_valid=gt_occ_img_is_valid,
+            )
             losses_occ = self.loss_weighted_and_prefixed(losses_occ, prefix='occ')
             losses.update(losses_occ)
 
