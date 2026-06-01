@@ -27,6 +27,7 @@ model = dict(
         r=8,
         alpha=8,        # scale = alpha/r = 1
         dropout=0.05,
+        inject_q2o_feat=True,  # 向 query_to_occ_feat 注入 LoRA；False 用于消融/旧权重兼容
         pretrained_path="ckpts/uniad_base_b2d.pth",
         training_stage=1,  # 切换阶段：1 / 2 / 3
     ),

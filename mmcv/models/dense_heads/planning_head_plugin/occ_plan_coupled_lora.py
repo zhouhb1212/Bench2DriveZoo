@@ -42,6 +42,7 @@ class OccPlanCoupledLoRA:
         self.r = self.lora_cfg.get('r', 4)
         self.alpha = self.lora_cfg.get('alpha', 8)
         self.dropout = self.lora_cfg.get('dropout', 0.1)
+        self.inject_q2o_feat = self.lora_cfg.get('inject_q2o_feat', False)
 
         self._injected = False
         self._current_stage = 0
@@ -105,7 +106,8 @@ class OccPlanCoupledLoRA:
         # This is the final bottleneck before occupancy logits — giving it LoRA
         # provides a direct gradient path from loss to trainable parameters,
         # bypassing the transformer decoder for stronger and more stable signal.
-        if hasattr(self.occ_head, 'query_to_occ_feat'):
+        # 可通过 inject_q2o_feat=False 关闭，用于消融实验或加载旧 checkpoint。
+        if self.inject_q2o_feat and hasattr(self.occ_head, 'query_to_occ_feat'):
             q2o = self.occ_head.query_to_occ_feat
             if hasattr(q2o, 'layers'):
                 for i in range(len(q2o.layers)):

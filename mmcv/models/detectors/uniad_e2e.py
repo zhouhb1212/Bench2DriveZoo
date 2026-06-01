@@ -15,6 +15,49 @@ from ..dense_heads.seg_head_plugin import IOU
 from .uniad_track import UniADTrack
 from mmcv.models.builder import build_head
 
+import re
+
+def _remap_query_to_occ_feat_keys(state_dict, model_has_q2o_lora=True):
+    """
+    双向兼容 query_to_occ_feat 的 key 格式。
+
+    model_has_q2o_lora=True (模型已注入 LoRA):
+        旧格式 → 新格式: layers.N.weight → layers.N.linear.weight
+        用于加载未注入 q2o LoRA 的旧 checkpoint。
+
+    model_has_q2o_lora=False (模型未注入 LoRA):
+        新格式 → 旧格式: layers.N.linear.weight → layers.N.weight
+        丢弃 layers.N.lora_adapter.*
+        用于消融实验：用 inject_q2o_feat=False 加载已注入的 ckpt。
+    """
+    remap = {}
+    drops = []
+
+    if model_has_q2o_lora:
+        # 旧→新: layers.N.weight → layers.N.linear.weight
+        for k in list(state_dict.keys()):
+            m = re.match(r'(query_to_occ_feat\.layers\.\d+)\.(weight|bias)$', k)
+            if m:
+                new_key = f'{m.group(1)}.linear.{m.group(2)}'
+                remap[k] = new_key
+        for old_key, new_key in remap.items():
+            state_dict[new_key] = state_dict.pop(old_key)
+    else:
+        # 新→旧: layers.N.linear.weight → layers.N.weight, 丢弃 lora_adapter.*
+        for k in list(state_dict.keys()):
+            m_lin = re.match(r'(query_to_occ_feat\.layers\.\d+)\.linear\.(weight|bias)$', k)
+            if m_lin:
+                new_key = f'{m_lin.group(1)}.{m_lin.group(2)}'
+                remap[k] = new_key
+            if 'query_to_occ_feat.layers.' in k and '.lora_adapter.' in k:
+                drops.append(k)
+        for old_key, new_key in remap.items():
+            state_dict[new_key] = state_dict.pop(old_key)
+        for k in drops:
+            state_dict.pop(k, None)
+
+    return state_dict
+
 @DETECTORS.register_module()
 class UniAD(UniADTrack):
     """
@@ -94,6 +137,15 @@ class UniAD(UniADTrack):
     @property
     def with_motion_head(self):
         return hasattr(self, 'motion_head') and self.motion_head is not None
+
+    def load_state_dict(self, state_dict, strict=True):
+        """双向兼容 query_to_occ_feat 的 key 格式。
+        根据 self.coupled_lora.inject_q2o_feat 自动选择映射方向。"""
+        has_q2o_lora = (self.coupled_lora is not None
+                        and getattr(self.coupled_lora, 'inject_q2o_feat', False))
+        state_dict = _remap_query_to_occ_feat_keys(state_dict,
+                                                    model_has_q2o_lora=has_q2o_lora)
+        return super().load_state_dict(state_dict, strict=False)
 
     @property
     def with_seg_head(self):

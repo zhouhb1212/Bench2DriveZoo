@@ -254,7 +254,12 @@ def main():
         logger.info('Validation disabled via --no-validate flag')
 
     if cfg.resume_from and os.path.exists(cfg.resume_from):
-        runner.resume(cfg.resume_from)
+        try:
+            runner.resume(cfg.resume_from)
+        except (ValueError, RuntimeError) as e:
+            logger.warning(f'Resume failed ({e}), falling back to load_checkpoint '
+                           f'(model weights only, optimizer state discarded)')
+            runner.load_checkpoint(cfg.resume_from)
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
