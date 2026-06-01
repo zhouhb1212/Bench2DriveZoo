@@ -139,12 +139,23 @@ class UniAD(UniADTrack):
         return hasattr(self, 'motion_head') and self.motion_head is not None
 
     def load_state_dict(self, state_dict, strict=True):
-        """双向兼容 query_to_occ_feat 的 key 格式。
-        根据 self.coupled_lora.inject_q2o_feat 自动选择映射方向。"""
+        """兼容不同 r/alpha 的旧 checkpoint：key 映射 + shape 不匹配的 LoRA 参数跳过。"""
         has_q2o_lora = (self.coupled_lora is not None
                         and getattr(self.coupled_lora, 'inject_q2o_feat', False))
         state_dict = _remap_query_to_occ_feat_keys(state_dict,
                                                     model_has_q2o_lora=has_q2o_lora)
+        # 过滤 shape 不匹配的 LoRA 参数（例如旧 ckpt r=16 → 当前 r=8）
+        model_state = self.state_dict()
+        skipped = []
+        for key in list(state_dict.keys()):
+            if key in model_state and state_dict[key].shape != model_state[key].shape:
+                skipped.append(key)
+                del state_dict[key]
+        if skipped:
+            import logging
+            logging.getLogger(__name__).warning(
+                f'Skipped {len(skipped)} LoRA params with shape mismatch '
+                f'(e.g. different r/alpha). First: {skipped[0]}')
         return super().load_state_dict(state_dict, strict=False)
 
     @property
