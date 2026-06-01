@@ -261,12 +261,12 @@ def main():
                            f'(model weights only, optimizer state discarded)')
             runner.load_checkpoint(cfg.resume_from)
         # 跨阶段 resume：旧 ckpt 的 epoch 可能等于 max_epochs，runner 会认为已完成。
-        # 重置 epoch/iter 确保新阶段训练正常进行。
-        if runner.epoch >= runner.max_epochs:
-            logger.info(f'Resumed from finished training (epoch={runner.epoch}), '
+        # 重置 _epoch/_iter 确保新阶段训练正常进行。
+        if runner._epoch >= runner.max_epochs:
+            logger.info(f'Resumed from finished training (epoch={runner._epoch}), '
                         f'resetting epoch to 0 for new stage')
-            runner.epoch = 0
-            runner.iter = 0
+            runner._epoch = 0
+            runner._iter = 0
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
