@@ -85,8 +85,13 @@ def main():
         cfg.work_dir = osp.join('./work_dirs', osp.splitext(osp.basename(args.config))[0])
 
     # if args.resume_from is not None:
-    if args.resume_from is not None and osp.isfile(args.resume_from):
-        cfg.resume_from = args.resume_from
+    if args.resume_from is not None:
+        if osp.isfile(args.resume_from):
+            cfg.resume_from = args.resume_from
+        else:
+            raise FileNotFoundError(
+                f'--resume-from path does not exist: {args.resume_from}\n'
+                f'  Check the path and try again.')
 
     if args.gpu_ids is not None:
         cfg.gpu_ids = args.gpu_ids
@@ -168,6 +173,10 @@ def main():
                         ]
 
     # Model
+    if cfg.model.get('coupled_lora_cfg') and cfg.model['coupled_lora_cfg'].get('training_stage'):
+        logger.info(
+            f"[LoRA] Effective training stage: "
+            f"{cfg.model['coupled_lora_cfg']['training_stage']}")
     model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'), test_cfg=cfg.get('test_cfg'))
     model.init_weights()
     model.CLASSES = datasets[0].CLASSES  # add an attribute for visualization convenience
