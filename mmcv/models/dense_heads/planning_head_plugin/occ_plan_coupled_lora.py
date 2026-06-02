@@ -38,9 +38,17 @@ class OccPlanCoupledLoRA:
         self.planning_head = planning_head
         self.lora_cfg = lora_cfg or {}
 
-        self.r = self.lora_cfg.get('r', 4)
-        self.alpha = self.lora_cfg.get('alpha', 8)
-        self.dropout = self.lora_cfg.get('dropout', 0.1)
+        # ── Per-head LoRA 参数（优先用子 dict，未指定时回退到全局默认值）──
+        occ_cfg = self.lora_cfg.get('occ_lora', {})
+        self.occ_r = occ_cfg.get('r', self.lora_cfg.get('r', 4))
+        self.occ_alpha = occ_cfg.get('alpha', self.lora_cfg.get('alpha', 8))
+        self.occ_dropout = occ_cfg.get('dropout', self.lora_cfg.get('dropout', 0.1))
+
+        plan_cfg = self.lora_cfg.get('planning_lora', {})
+        self.plan_r = plan_cfg.get('r', self.lora_cfg.get('r', 4))
+        self.plan_alpha = plan_cfg.get('alpha', self.lora_cfg.get('alpha', 8))
+        self.plan_dropout = plan_cfg.get('dropout', self.lora_cfg.get('dropout', 0.1))
+
         self.inject_q2o_feat = self.lora_cfg.get('inject_q2o_feat', False)
 
         self._injected = False
@@ -78,7 +86,7 @@ class OccPlanCoupledLoRA:
             - query_to_occ_feat MLP (instance query → occupancy feature 的门户):
                 layers[0..2] → LoRALinear
         """
-        r, alpha, dropout = self.r, self.alpha, self.dropout
+        r, alpha, dropout = self.occ_r, self.occ_alpha, self.occ_dropout
         decoder = self.occ_head.transformer_decoder  # DetrTransformerDecoder
         if not hasattr(decoder, 'layers'):
             return
@@ -125,7 +133,7 @@ class OccPlanCoupledLoRA:
                                 linear1 / linear2 → LoRALinear
             - bev_adapter Conv2d: 冻结不注入
         """
-        r, alpha, dropout = self.r, self.alpha, self.dropout
+        r, alpha, dropout = self.plan_r, self.plan_alpha, self.plan_dropout
         ph = self.planning_head
 
         # 1. mlp_fuser[0]: Linear(768, 256)
@@ -266,9 +274,11 @@ class OccPlanCoupledLoRA:
 
         info = (
             f"[OccPlanCoupledLoRA] Stage {self._current_stage}\n"
-            f"  OccHead  LoRA: {occ_trainable:,} / {occ_total:,} "
+            f"  OccHead  LoRA (r={self.occ_r}, alpha={self.occ_alpha}): "
+            f"{occ_trainable:,} / {occ_total:,} "
             f"({100*occ_trainable/max(occ_total,1):.1f}%)\n"
-            f"  Planning LoRA: {plan_trainable:,} / {plan_total:,} "
+            f"  Planning LoRA (r={self.plan_r}, alpha={self.plan_alpha}): "
+            f"{plan_trainable:,} / {plan_total:,} "
             f"({100*plan_trainable/max(plan_total,1):.1f}%)\n"
             f"  Total trainable: {total_trainable:,} / {total_params:,} "
             f"({100*total_trainable/max(total_params,1):.2f}%)"

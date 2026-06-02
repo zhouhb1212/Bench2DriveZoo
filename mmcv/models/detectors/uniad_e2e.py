@@ -153,9 +153,22 @@ class UniAD(UniADTrack):
                 del state_dict[key]
         if skipped:
             import logging
-            logging.getLogger(__name__).warning(
-                f'Skipped {len(skipped)} LoRA params with shape mismatch '
-                f'(e.g. different r/alpha). First: {skipped[0]}')
+            logger = logging.getLogger(__name__)
+            # 被跳过的参数全部属于同一个 head → 该 head 在前阶段必定是冻结的
+            # （Stage1 只训 OccHead，Stage2 只训 PlanningHead），
+            # shape 不匹配是预期行为，用 info；混合跳过才 warning
+            occ_skipped = [k for k in skipped if k.startswith('occ_head.')]
+            plan_skipped = [k for k in skipped if k.startswith('planning_head.')]
+            if bool(occ_skipped) != bool(plan_skipped):
+                head_name = 'OccHead' if occ_skipped else 'PlanningHead'
+                logger.info(
+                    f'Skipped {len(skipped)} untrained {head_name} LoRA params '
+                    f'(that head was frozen in the source checkpoint, '
+                    f'shape mismatch is expected). {head_name} LoRA will use fresh init.')
+            else:
+                logger.warning(
+                    f'Skipped {len(skipped)} LoRA params with shape mismatch '
+                    f'(e.g. different r/alpha). First: {skipped[0]}')
         return super().load_state_dict(state_dict, strict=False)
 
     @property

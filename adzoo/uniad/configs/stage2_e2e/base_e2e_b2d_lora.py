@@ -24,8 +24,11 @@ model = dict(
     ),
     coupled_lora_cfg=dict(
         r=8,
-        alpha=8,        # scale = alpha/r = 1
+        alpha=8,        # scale = alpha/r = 1（全局默认值；per-head 配置优先）
         dropout=0.05,
+        # Per-head LoRA 参数覆写（可选，不指定时回退到全局默认值）
+        occ_lora=dict(r=16, alpha=16),       # Stage 1 OccHead 微调容量更大
+        planning_lora=dict(r=8, alpha=8),    # Stage 2 PlanningHead 微调容量
         inject_q2o_feat=True,  # 向 query_to_occ_feat 注入 LoRA；False 用于消融/旧权重兼容
         pretrained_path="ckpts/uniad_base_b2d.pth",
         training_stage=1,  # 切换阶段：1 / 2
