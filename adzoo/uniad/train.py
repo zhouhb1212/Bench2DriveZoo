@@ -62,8 +62,8 @@ def parse_args():
     parser.add_argument(
         '--training-stage',
         type=int,
-        choices=[1, 2, 3],
-        help='override coupled_lora_cfg.training_stage (1/2/3)')
+        choices=[1, 2],
+        help='override coupled_lora_cfg.training_stage (1/2)')
     parser.add_argument(
         '--lr',
         type=float,

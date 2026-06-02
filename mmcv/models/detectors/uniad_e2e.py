@@ -93,7 +93,7 @@ class UniAD(UniADTrack):
         assert set(task_loss_weight.keys()) == \
                {'track', 'occ', 'motion', 'map', 'planning'}
 
-        # Occupancy-Planning Coupled LoRA (三阶段训练管理器)
+        # Occupancy-Planning Coupled LoRA (两阶段训练管理器)
         if coupled_lora_cfg is not None and occ_head is not None and planning_head is not None:
             # 预加载 occ_head / planning_head 预训练权重到子模块
             # 必须在 LoRA 注入之前完成，确保 inject_lora_to_linear 的 copy_() 复制的是预训练值
@@ -268,8 +268,6 @@ class UniAD(UniADTrack):
                        and self.coupled_lora.get_current_stage() == 1)
         stage2_only = (self.coupled_lora is not None
                        and self.coupled_lora.get_current_stage() == 2)
-        stage3_joint = (self.coupled_lora is not None
-                        and self.coupled_lora.get_current_stage() == 3)
 
         # 冻结 head（track/map/motion）用 no_grad 执行，节省显存和算力
         # 所有 LoRA stage 均冻结这些 head；仅无 LoRA 时正常执行
@@ -333,7 +331,7 @@ class UniAD(UniADTrack):
             losses_motion = self.loss_weighted_and_prefixed(losses_motion, prefix='motion')
             monitoring_losses.update(losses_motion)
 
-        # Forward Occ Head（LoRA 可训练：Stage 1/3；Stage 2 跳过：
+        # Forward Occ Head（LoRA 可训练：Stage 1；Stage 2 跳过：
         # PlanningHead.forward_train 硬编码 occ_mask=None，不需要 Occ 特征）
         if self.with_occ_head and not stage2_only:
             if outs_motion['track_query'].shape[1] == 0:# avoid 0 track
@@ -352,7 +350,7 @@ class UniAD(UniADTrack):
             losses_occ = self.loss_weighted_and_prefixed(losses_occ, prefix='occ')
             losses.update(losses_occ)
 
-        # Forward Plan Head（LoRA 可训练：Stage 2/3；Stage 1 跳过以加速训练）
+        # Forward Plan Head（LoRA 可训练：Stage 2；Stage 1 跳过以加速训练）
         if self.with_planning_head and not stage1_only:
             outs_planning = self.planning_head.forward_train(
                 bev_embed, outs_motion, sdc_planning, sdc_planning_mask,

@@ -1,4 +1,5 @@
 import copy
+import functools
 import re
 import numpy as np
 import os
@@ -54,6 +55,7 @@ class B2D_E2E_Dataset(Custom3DDataset):
         self._apply_oversample(oversample_cfg)
 
     @staticmethod
+    @functools.lru_cache(maxsize=None)
     def _extract_scenario(folder):
         """从 folder 名提取场景类型。
 
@@ -92,13 +94,9 @@ class B2D_E2E_Dataset(Custom3DDataset):
         #    other_by_type:  scenario → {folder: [frames]} (按子路线细分，保证时序连续)
         target_groups = {}
         other_by_type = {}
-        _sc_cache = {}  # folder → scenario type 缓存，避免重复 _extract_scenario
         for item in self.data_infos:
             folder = item['folder']
-            scenario = _sc_cache.get(folder)
-            if scenario is None:
-                scenario = self._extract_scenario(folder)
-                _sc_cache[folder] = scenario
+            scenario = self._extract_scenario(folder)
             if any(s in scenario for s in scenarios):
                 target_groups.setdefault(scenario, []).append(item)
             else:

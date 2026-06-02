@@ -3,10 +3,9 @@
 #
 # 基于 base_e2e_b2d_lora.py，使用 mini 数据集（10 场景：8 train + 2 val）。
 #
-# 三阶段训练：
+# 两阶段训练：
 #   Stage 1 (training_stage=1): 仅 OccHead LoRA，lr=3e-4
 #   Stage 2 (training_stage=2): 仅 PlanningHead LoRA，lr=3e-4
-#   Stage 3 (training_stage=3): 两者联合 + 一致性损失，lr=1e-4
 #
 # 用法：
 #   ./adzoo/uniad/uniad_dist_train.sh ./adzoo/uniad/configs/stage2_e2e/base_e2e_b2d_lora_mini.py 1 \

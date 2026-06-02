@@ -3,10 +3,9 @@
 #
 # 基于 base_e2e_b2d.py，增加 LoRA 微调相关配置。
 #
-# 三阶段训练（必须按顺序执行）：
+# 两阶段训练（必须按顺序执行）：
 #   Stage 1 (training_stage=1): 仅 OccHead LoRA，lr=2e-4，epochs=1~2
 #   Stage 2 (training_stage=2): 仅 PlanningHead LoRA，lr=2e-4，resume Stage1 ckpt
-#   Stage 3 (training_stage=3): 两者联合微调，lr=5e-5，resume Stage2 ckpt
 #
 # 用法：通过命令行 --training-stage 和 --lr 覆盖
 # ---------------------------------------------------------------------------------#
@@ -29,16 +28,14 @@ model = dict(
         dropout=0.05,
         inject_q2o_feat=True,  # 向 query_to_occ_feat 注入 LoRA；False 用于消融/旧权重兼容
         pretrained_path="ckpts/uniad_base_b2d.pth",
-        training_stage=1,  # 切换阶段：1 / 2 / 3
+        training_stage=1,  # 切换阶段：1 / 2
     ),
-    # Stage 3 联合训练时降低 planning 权重，避免 collision loss 主导梯度
-    # collision_0/1/2 数值远大于 occ dice/mask loss，需要平衡
     task_loss_weight=dict(
         track=1.0,
         map=1.0,
         motion=1.0,
         occ=1.0,
-        planning=0.5,  # 原始 1.0 → 0.5，平衡 occ/planning 梯度贡献
+        planning=1.0,
     ),
 )
 
@@ -49,8 +46,7 @@ optimizer = dict(
     weight_decay=0.1,  # 增大 weight_decay 鼓励 flatter minima，降低 sharp minimum 附近的梯度曲率
 )
 
-# Stage 3 联合训练时，部分 LoRA 参数通过不同梯度路径参与 loss 计算，
-# DDP 需要检测 unused 参数以避免 allreduce 时梯度缓冲区未填充的错误
+# DDP 关闭 unused 参数检测，避免 allreduce 时梯度缓冲区未填充的错误
 find_unused_parameters = False
 
 # ── 过采样配置：针对特定场景做场景级过采样（LoRA 快速验证用）──

@@ -15,6 +15,11 @@ from mmcv.fileio.io import load, dump
 import numpy as np
 import pycocotools.mask as mask_util
 
+def _unwrap(x):
+    """MultiScaleFlipAug3D wraps values in a list; unwrap if needed."""
+    return x[0] if isinstance(x, (list, tuple)) else x
+
+
 def custom_encode_mask_results(mask_results):
     """Encode bitmap mask to RLE code. Semantic Masks only
     Args:
@@ -63,10 +68,9 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     #   stage=None (non-LoRA, or no coupled_lora): always eval
     #   stage=1: OccHead LoRA only → eval occ
     #   stage=2: PlanningHead LoRA only → skip occ
-    #   stage=3: Joint → eval occ
     eval_occ = hasattr(inner, 'with_occ_head') \
                 and inner.with_occ_head \
-                and (_lora_stage is None or _lora_stage in (1, 3))
+                and (_lora_stage is None or _lora_stage == 1)
     if eval_occ:
         # 30mx30m, 100mx100m at 50cm resolution
         EVALUATION_RANGES = {'30x30': (70, 130),
@@ -83,10 +87,9 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     #   stage=None: always eval
     #   stage=1: OccHead LoRA only → skip planning
     #   stage=2: PlanningHead LoRA only → eval planning
-    #   stage=3: Joint → eval planning
     eval_planning =  hasattr(inner, 'with_planning_head') \
                       and inner.with_planning_head \
-                      and (_lora_stage is None or _lora_stage in (2, 3))
+                      and (_lora_stage is None or _lora_stage == 2)
     if eval_planning:
         planning_metrics = UniADPlanningMetric().cuda()
         
@@ -97,10 +100,6 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     if rank == 0:
         prog_bar = ProgressBar(len(dataset))
     time.sleep(2)  # This line can prevent deadlock problem in some cases.
-    # MultiScaleFlipAug3D wraps values in a list; unwrap if needed
-    def _unwrap(x):
-        return x[0] if isinstance(x, (list, tuple)) else x
-
     have_mask = False
     num_occ = 0
     for i, data in enumerate(data_loader):
@@ -110,9 +109,8 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
 
             #import pdb;pdb.set_trace()
 
-            # # EVAL planning
+            # EVAL planning
             if eval_planning:
-                # TODO: Wrap below into a func
                 segmentation = _unwrap(result[0]['planning']['planning_gt']['segmentation'])
                 sdc_planning = _unwrap(result[0]['planning']['planning_gt']['sdc_planning'])
                 sdc_planning_mask = _unwrap(result[0]['planning']['planning_gt']['sdc_planning_mask'])

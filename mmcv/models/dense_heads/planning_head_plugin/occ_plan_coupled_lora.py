@@ -2,7 +2,7 @@
 # Occupancy-Planning Coupled LoRA (双 LoRA 微调)
 #
 # 在 OccHead Transformer Decoder + query_to_occ_feat MLP 和 PlanningHeadSingleMode
-# adapter 路径中注入 LoRA，通过三阶段训练对 OccHead 和 PlanningHead 进行局部微调。
+# adapter 路径中注入 LoRA，通过两阶段训练对 OccHead 和 PlanningHead 进行局部微调。
 # ---------------------------------------------------------------------------------#
 
 import torch.nn as nn
@@ -21,12 +21,11 @@ class OccPlanCoupledLoRA:
 
     负责:
         1. 向 OccHead 和 PlanningHead 精确注入 LoRA
-        2. 管理三阶段训练的 freeze / unfreeze
+        2. 管理两阶段训练的 freeze / unfreeze
 
-    三阶段训练:
+    两阶段训练:
         Stage 1: 仅训练 OccHead LoRA
         Stage 2: 仅训练 PlanningHead LoRA
-        Stage 3: 两者 LoRA 联合训练
 
     Args:
         occ_head: OccHead 实例
@@ -160,7 +159,7 @@ class OccPlanCoupledLoRA:
                 p.requires_grad = False
 
     # ------------------------------------------------------------------#
-    # 三阶段训练管理
+    # 两阶段训练管理
     # ------------------------------------------------------------------#
 
     def set_training_stage(self, stage):
@@ -169,9 +168,8 @@ class OccPlanCoupledLoRA:
 
         stage=1: 仅 OccHead LoRA 可训练
         stage=2: 仅 PlanningHead LoRA 可训练
-        stage=3: 两者 LoRA 均可训练
         """
-        assert stage in (1, 2, 3), f"stage must be 1/2/3, got {stage}"
+        assert stage in (1, 2), f"stage must be 1 or 2, got {stage}"
         self._current_stage = stage
 
         # 全部参数冻结
@@ -181,9 +179,9 @@ class OccPlanCoupledLoRA:
             p.requires_grad = False
 
         # 按阶段解冻
-        if stage in (1, 3):
+        if stage == 1:
             self._set_lora_trainable(self.occ_head, True)
-        if stage in (2, 3):
+        if stage == 2:
             self._set_lora_trainable(self.planning_head, True)
 
         # 冻结 OccHead / PlanningHead 内所有 LayerNorm
