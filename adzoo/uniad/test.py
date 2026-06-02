@@ -137,6 +137,8 @@ def main():
             # hard-code way to remove EvalHook args
             for key in ['interval', 'tmpdir', 'start', 'gpu_collect', 'save_best', 'rule', 'by_epoch']:
                 eval_kwargs.pop(key, None)
+            lora_stage = cfg.model.get('coupled_lora_cfg', {}).get('training_stage', None)
+            eval_kwargs['lora_stage'] = lora_stage
             eval_kwargs.update(dict(metric=args.eval, **kwargs))
             print(dataset.evaluate(outputs, **eval_kwargs))
 

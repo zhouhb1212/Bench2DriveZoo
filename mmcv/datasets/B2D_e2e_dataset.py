@@ -703,7 +703,9 @@ class B2D_E2E_Dataset(Custom3DDataset):
                  result_names=['pts_bbox'],
                  show=False,
                  out_dir=None,
-                 pipeline=None):
+                 pipeline=None,
+                 lora_stage=None,
+                 **kwargs):
         """Evaluation in nuScenes protocol.
 
         Args:
@@ -814,6 +816,12 @@ class B2D_E2E_Dataset(Custom3DDataset):
                     planning_tab.add_row(row_value)
                 print(planning_tab)
 
+                # Write planning metrics into detail dict for logging
+                for key in planning_results_computed.keys():
+                    value = planning_results_computed[key]
+                    for i in range(len(value)):
+                        detail[f'planning/{key}_{(i+1)*0.5:.1f}s'] = float(value[i])
+
         if 'occ_results_computed' in results.keys():
             occ_results_computed = results['occ_results_computed']
             occ_tab = PrettyTable()
@@ -839,6 +847,41 @@ class B2D_E2E_Dataset(Custom3DDataset):
                         detail[f'occ/{key}_100x100'] = float(value[1])
             detail['occ/num_frames'] = occ_results_computed.get('num_occ', 0)
             detail['occ/ratio'] = occ_results_computed.get('ratio_occ', 0)
+
+        # Stage-Aware Highlight Report
+        if lora_stage is not None:
+            print("\n" + "=" * 60)
+            print(f"            LoRA Stage-Aware Evaluation Report (Stage {lora_stage})            ")
+            print("=" * 60)
+            if lora_stage == 1:
+                print(">>> TARGET FOCUS: OCCUPANCY PERFORMANCE (突出OCC指标) <<<")
+                if 'occ_results_computed' in results.keys():
+                    occ_res = results['occ_results_computed']
+                    iou_scores = occ_res.get('iou', [0, 0])
+                    pq_scores = occ_res.get('pq', [0, 0])
+                    sq_scores = occ_res.get('sq', [0, 0])
+                    rq_scores = occ_res.get('rq', [0, 0])
+                    
+                    print(f"  [Occ IoU]   30x30m: {iou_scores[0]:.2f}% | 100x100m: {iou_scores[1]:.2f}%")
+                    print(f"  [Occ PQ]    30x30m: {pq_scores[0]:.2f}%  | 100x100m: {pq_scores[1]:.2f}%")
+                    print(f"  [Occ SQ]    30x30m: {sq_scores[0]:.2f}%  | 100x100m: {sq_scores[1]:.2f}%")
+                    print(f"  [Occ RQ]    30x30m: {rq_scores[0]:.2f}%  | 100x100m: {rq_scores[1]:.2f}%")
+                else:
+                    print("  [Warning] Occupancy results not found in evaluation outputs!")
+            elif lora_stage == 2:
+                print(">>> TARGET FOCUS: PLANNING PERFORMANCE (突出PLAN指标) <<<")
+                if 'planning_results_computed' in results.keys():
+                    plan_res = results['planning_results_computed']
+                    l2_err = plan_res.get('L2', [0]*6)
+                    obj_box_col = plan_res.get('obj_box_col', [0]*6)
+                    
+                    print("  [Plan L2 Error (m)]")
+                    print(f"    0.5s: {l2_err[0]:.4f} | 1.0s: {l2_err[1]:.4f} | 1.5s: {l2_err[2]:.4f} | 2.0s: {l2_err[3]:.4f} | 2.5s: {l2_err[4]:.4f} | 3.0s: {l2_err[5]:.4f}")
+                    print("  [Plan Obj Box Collision Rate]")
+                    print(f"    0.5s: {obj_box_col[0]:.4f} | 1.0s: {obj_box_col[1]:.4f} | 1.5s: {obj_box_col[2]:.4f} | 2.0s: {obj_box_col[3]:.4f} | 2.5s: {obj_box_col[4]:.4f} | 3.0s: {obj_box_col[5]:.4f}")
+                else:
+                    print("  [Warning] Planning results not found in evaluation outputs!")
+            print("=" * 60 + "\n")
 
         return detail
 

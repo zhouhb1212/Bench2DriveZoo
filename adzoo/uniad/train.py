@@ -244,6 +244,8 @@ def main():
         )
         eval_cfg = cfg.get('evaluation', {}).copy()  # 浅拷贝避免修改原始 cfg
         eval_cfg.setdefault('by_epoch', cfg.runner['type'] != 'IterBasedRunner')
+        lora_stage = cfg.model.get('coupled_lora_cfg', {}).get('training_stage', None)
+        eval_cfg['lora_stage'] = lora_stage
         # 验证结果保存到 work_dir/val/<timestamp>/ 下，使用绝对路径避免 cwd 依赖
         eval_cfg['jsonfile_prefix'] = osp.join(
             osp.abspath(cfg.work_dir), 'val',

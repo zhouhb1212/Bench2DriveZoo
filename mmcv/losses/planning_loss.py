@@ -59,19 +59,26 @@ class CollisionLoss(nn.Module):
         xb1, yb1 = torch.max(corners_b[:, 0]), torch.max(corners_b[:, 1])
         xb2, yb2 = torch.min(corners_b[:, 0]), torch.min(corners_b[:, 1])
         
-        xi1, yi1 = min(xa1, xb1), min(ya1, yb1)
-        xi2, yi2 = max(xa2, xb2), max(ya2, yb2)
-        intersect = max((xi1 - xi2), xi1.new_zeros(1, ).to(xi1.device)) * max((yi1 - yi2), xi1.new_zeros(1,).to(xi1.device))
-        return intersect
+        xi1, yi1 = torch.minimum(xa1, xb1), torch.minimum(ya1, yb1)
+        xi2, yi2 = torch.maximum(xa2, xb2), torch.maximum(ya2, yb2)
+        
+        w_inter = torch.clamp(xi1 - xi2, min=0)
+        h_inter = torch.clamp(yi1 - yi2, min=0)
+        return w_inter * h_inter
 
     def to_corners(self, bbox):
         x, y, w, l, theta = bbox
         corners = torch.tensor([
             [w/2, -l/2], [w/2, l/2], [-w/2, l/2], [-w/2,-l/2]  
         ]).to(x.device) # 4,2
-        rot_mat = torch.tensor(
-            [[torch.cos(theta), torch.sin(theta)],
-             [-torch.sin(theta), torch.cos(theta)]]
-        ).to(x.device)
-        new_corners = rot_mat @ corners.T + torch.tensor(bbox[:2])[:, None].to(x.device)
+        
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+        rot_mat = torch.stack([
+            torch.stack([cos_t, sin_t]),
+            torch.stack([-sin_t, cos_t])
+        ]).to(x.device)
+        
+        translation = torch.stack([x, y])[:, None]
+        new_corners = rot_mat @ corners.T + translation
         return new_corners.T

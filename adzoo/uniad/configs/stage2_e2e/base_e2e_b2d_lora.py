@@ -31,14 +31,14 @@ model = dict(
         planning_lora=dict(r=8, alpha=8),    # Stage 2 PlanningHead 微调容量
         inject_q2o_feat=True,  # 向 query_to_occ_feat 注入 LoRA；False 用于消融/旧权重兼容
         pretrained_path="ckpts/uniad_base_b2d.pth",
-        training_stage=1,  # 切换阶段：1 / 2
+        training_stage=2,  # 切换阶段：1 / 2
     ),
     task_loss_weight=dict(
         track=1.0,
         map=1.0,
         motion=1.0,
         occ=1.0,
-        planning=1.0,
+        planning=2.0,
     ),
 )
 
@@ -54,6 +54,7 @@ find_unused_parameters = False
 
 # ── 过采样配置：针对特定场景做场景级过采样（LoRA 快速验证用）──
 data = dict(
+    workers_per_gpu=2,
     train=dict(
         oversample_cfg=dict(
             enable=True,                            # True 时启用
@@ -65,7 +66,7 @@ data = dict(
     ),
 )
 
-total_epochs = 2
+total_epochs = 1
 runner = dict(type="EpochBasedRunner", max_epochs=2)
 
 # ── Checkpoint 和验证频率 ──
@@ -79,7 +80,7 @@ checkpoint_config = dict(
 # 验证每 epoch 结束时执行一次（by_epoch=True, interval=1）
 evaluation = dict(interval=1, by_epoch=True)
 log_config = dict(
-    interval=200,
+    interval=10,
     hooks=[
         dict(type="TextLoggerHook"),
         dict(type="TensorboardLoggerHook"),

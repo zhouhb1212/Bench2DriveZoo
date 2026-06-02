@@ -147,11 +147,27 @@ class UniAD(UniADTrack):
         # 过滤 shape 不匹配的 LoRA 参数（例如旧 ckpt r=16 → 当前 r=8）
         model_state = self.state_dict()
         skipped = []
+        skipped_shapes = {}
         for key in list(state_dict.keys()):
             if key in model_state and state_dict[key].shape != model_state[key].shape:
                 skipped.append(key)
+                skipped_shapes[key] = state_dict[key].shape
                 del state_dict[key]
         if skipped:
+            lora_skipped = [k for k in skipped if 'lora' in k]
+            if lora_skipped:
+                first_k = lora_skipped[0]
+                error_msg = (
+                    f"\n" + "!" * 80 + "\n"
+                    f"[LoRA Shape Mismatch Error] Loaded checkpoint has different LoRA dimensions than the model!\n"
+                    f"Skipped {len(lora_skipped)} LoRA parameters because of shape mismatch.\n"
+                    f"  Model layer expects shape: {model_state[first_k].shape}\n"
+                    f"  Checkpoint has shape:      {skipped_shapes[first_k]}\n"
+                    f"  First mismatch key:        {first_k}\n"
+                    f"Please update your config file (e.g. model.coupled_lora_cfg.r and alpha) to match the checkpoint.\n"
+                    f"!" * 80 + "\n"
+                )
+                raise RuntimeError(error_msg)
             import logging
             logger = logging.getLogger(__name__)
             # 被跳过的参数全部属于同一个 head → 该 head 在前阶段必定是冻结的

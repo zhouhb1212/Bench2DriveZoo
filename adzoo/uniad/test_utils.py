@@ -64,13 +64,8 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     if hasattr(inner, 'coupled_lora') and inner.coupled_lora is not None:
         _lora_stage = inner.coupled_lora.get_current_stage()
 
-    # Occ eval init
-    #   stage=None (non-LoRA, or no coupled_lora): always eval
-    #   stage=1: OccHead LoRA only → eval occ
-    #   stage=2: PlanningHead LoRA only → skip occ
-    eval_occ = hasattr(inner, 'with_occ_head') \
-                and inner.with_occ_head \
-                and (_lora_stage is None or _lora_stage == 1)
+    # Occ eval init: always evaluate fully if occ head exists
+    eval_occ = hasattr(inner, 'with_occ_head') and inner.with_occ_head
     if eval_occ:
         # 30mx30m, 100mx100m at 50cm resolution
         EVALUATION_RANGES = {'30x30': (70, 130),
@@ -83,13 +78,8 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
         for key in EVALUATION_RANGES.keys():
             panoptic_metrics[key] = PanopticMetric(n_classes=n_classes, temporally_consistent=True).cuda()
 
-    # Plan eval init
-    #   stage=None: always eval
-    #   stage=1: OccHead LoRA only → skip planning
-    #   stage=2: PlanningHead LoRA only → eval planning
-    eval_planning =  hasattr(inner, 'with_planning_head') \
-                      and inner.with_planning_head \
-                      and (_lora_stage is None or _lora_stage == 2)
+    # Plan eval init: always evaluate fully if planning head exists
+    eval_planning =  hasattr(inner, 'with_planning_head') and inner.with_planning_head
     if eval_planning:
         planning_metrics = UniADPlanningMetric().cuda()
         
