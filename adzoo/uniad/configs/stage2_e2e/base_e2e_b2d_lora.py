@@ -4,8 +4,8 @@
 # 基于 base_e2e_b2d.py，增加 LoRA 微调相关配置。
 #
 # 两阶段训练（必须按顺序执行）：
-#   Stage 1 (training_stage=1): 仅 OccHead LoRA，lr=2e-4，epochs=1~2
-#   Stage 2 (training_stage=2): 仅 PlanningHead LoRA，lr=2e-4，resume Stage1 ckpt
+#   Stage 1 (training_stage=1): 仅 OccHead LoRA，lr=3e-4，epochs=2
+#   Stage 2 (training_stage=2): 仅 PlanningHead LoRA，lr=3e-4，resume Stage1 ckpt
 #
 # 用法：通过命令行 --training-stage 和 --lr 覆盖
 # ---------------------------------------------------------------------------------#
@@ -27,7 +27,7 @@ model = dict(
         alpha=16,        # scale = alpha/r = 1（全局默认值；per-head 配置优先）
         dropout=0.05,
         # Per-head LoRA 参数覆写（可选，不指定时回退到全局默认值）
-        occ_lora=dict(r=16, alpha=16),       # Stage 1 OccHead 微调容量更大
+        occ_lora=dict(r=16, alpha=32),       # Stage 1 OccHead: scale=alpha/r=2
         planning_lora=dict(r=8, alpha=8),    # Stage 2 PlanningHead 微调容量
         inject_q2o_feat=True,  # 向 query_to_occ_feat 注入 LoRA；False 用于消融/旧权重兼容
         pretrained_path="ckpts/uniad_base_b2d.pth",
@@ -45,8 +45,8 @@ model = dict(
 # ── 优化器（仅 LoRA 参数 requires_grad=True，其余已冻结）──
 optimizer = dict(
     type="AdamW",
-    lr=1e-4,      # 累积 2 步等效 batch=2，按线性缩放 lr（2e-4 × 2/4 = 1e-4）
-    weight_decay=0.1,  # 增大 weight_decay 鼓励 flatter minima，降低 sharp minimum 附近的梯度曲率
+    lr=3e-4,      # LoRA 推荐 LR 2e-4~1e-3，3e-4 是 Stage1 的验证值
+    weight_decay=0.01,  # LoRA 参数少，0.01 避免衰减过强拉向零
 )
 
 # DDP 关闭 unused 参数检测，避免 allreduce 时梯度缓冲区未填充的错误
@@ -105,6 +105,6 @@ lr_config = dict(
     policy="CosineAnnealing",
     warmup="linear",
     warmup_iters=200,             # 训练开始前 200 iter warmup
-    warmup_ratio=0.1,             # 从 0.1*peak 起步（1e-5）
-    min_lr_ratio=1e-2,            # 最终 lr 衰减到 peak 的 1%（1e-6）
+    warmup_ratio=0.1,             # 从 0.1*peak 起步（3e-5）
+    min_lr_ratio=5e-2,            # 最终 lr 衰减到 peak 的 5%（1.5e-5），防止后期 delta 过小
 )
