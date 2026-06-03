@@ -23,15 +23,15 @@ model = dict(
         compute_aux_loss=False,
     ),
     coupled_lora_cfg=dict(
-        r=8,
-        alpha=8,        # scale = alpha/r = 1（全局默认值；per-head 配置优先）
+        r=16,
+        alpha=16,        # scale = alpha/r = 1（全局默认值；per-head 配置优先）
         dropout=0.05,
         # Per-head LoRA 参数覆写（可选，不指定时回退到全局默认值）
         occ_lora=dict(r=16, alpha=16),       # Stage 1 OccHead 微调容量更大
         planning_lora=dict(r=8, alpha=8),    # Stage 2 PlanningHead 微调容量
         inject_q2o_feat=True,  # 向 query_to_occ_feat 注入 LoRA；False 用于消融/旧权重兼容
         pretrained_path="ckpts/uniad_base_b2d.pth",
-        training_stage=2,  # 切换阶段：1 / 2
+        training_stage=1,  # 切换阶段：1 / 2
     ),
     task_loss_weight=dict(
         track=1.0,
@@ -54,7 +54,8 @@ find_unused_parameters = False
 
 # ── 过采样配置：针对特定场景做场景级过采样（LoRA 快速验证用）──
 data = dict(
-    workers_per_gpu=2,
+    samples_per_gpu=1,
+    workers_per_gpu=4,
     train=dict(
         oversample_cfg=dict(
             enable=True,                            # True 时启用
@@ -66,7 +67,7 @@ data = dict(
     ),
 )
 
-total_epochs = 1
+total_epochs = 2
 runner = dict(type="EpochBasedRunner", max_epochs=2)
 
 # ── Checkpoint 和验证频率 ──
@@ -88,11 +89,11 @@ log_config = dict(
 )
 
 # ── AMP 混合精度 + 梯度累积 ──
-# 累积 2 步（非 4 步）：增大更新频率让优化器能及时纠正振荡方向，
+# 累积 2 步：增大更新频率让优化器能及时纠正振荡方向，
 # 避免连续多步高梯度累加后单次大更新冲过头
 optimizer_config = dict(
     type='GradientCumulativeFp16OptimizerHook',
-    cumulative_iters=2,  # 每 2 个 iter 更新一次参数（更新频率翻倍）
+    cumulative_iters=2,  # 累积 2 步：每个 GPU 的 samples_per_gpu 为 1，累积 2 步达到有效 batch_size=2
     grad_clip=dict(max_norm=2.0, norm_type=2),  # LoRA 稳定 grad_norm ~0.8-1.1，2.0 过滤异常梯度
 )
 

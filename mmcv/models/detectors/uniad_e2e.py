@@ -14,7 +14,6 @@ import os
 from ..dense_heads.seg_head_plugin import IOU
 from .uniad_track import UniADTrack
 from mmcv.models.builder import build_head
-
 import re
 
 def _remap_query_to_occ_feat_keys(state_dict, model_has_q2o_lora=True):
@@ -57,6 +56,7 @@ def _remap_query_to_occ_feat_keys(state_dict, model_has_q2o_lora=True):
             state_dict.pop(k, None)
 
     return state_dict
+
 
 @DETECTORS.register_module()
 class UniAD(UniADTrack):
@@ -126,6 +126,25 @@ class UniAD(UniADTrack):
         else:
             self.coupled_lora = None
 
+    def train(self, mode=True):
+        """重写 train 方法，以保证在整个微调训练期间，所有已冻结参数模块的
+        BatchNorm 和 LayerNorm 强制处于 eval() 模式，防止其 running stats 被漂移污染。
+        """
+        super(UniAD, self).train(mode)
+        if mode and self.coupled_lora is not None:
+            # 强制将所有 BatchNorm 相关的层置为 eval 模式并再次冻结参数
+            for m in self.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.SyncBatchNorm)):
+                    m.eval()
+                    for p in m.parameters():
+                        p.requires_grad = False
+            # 强制将所有 LayerNorm 层置为 eval 模式并再次冻结参数
+            for m in self.modules():
+                if isinstance(m, nn.LayerNorm):
+                    m.eval()
+                    for p in m.parameters():
+                        p.requires_grad = False
+
     @property
     def with_planning_head(self):
         return hasattr(self, 'planning_head') and self.planning_head is not None
@@ -139,52 +158,15 @@ class UniAD(UniADTrack):
         return hasattr(self, 'motion_head') and self.motion_head is not None
 
     def load_state_dict(self, state_dict, strict=True):
-        """兼容不同 r/alpha 的旧 checkpoint：key 映射 + shape 不匹配的 LoRA 参数跳过。"""
+        """支持消融实验中 query_to_occ_feat 键的映射兼容，并在 shape 不匹配时进行过滤加载。"""
         has_q2o_lora = (self.coupled_lora is not None
                         and getattr(self.coupled_lora, 'inject_q2o_feat', False))
         state_dict = _remap_query_to_occ_feat_keys(state_dict,
                                                     model_has_q2o_lora=has_q2o_lora)
-        # 过滤 shape 不匹配的 LoRA 参数（例如旧 ckpt r=16 → 当前 r=8）
         model_state = self.state_dict()
-        skipped = []
-        skipped_shapes = {}
         for key in list(state_dict.keys()):
             if key in model_state and state_dict[key].shape != model_state[key].shape:
-                skipped.append(key)
-                skipped_shapes[key] = state_dict[key].shape
                 del state_dict[key]
-        if skipped:
-            lora_skipped = [k for k in skipped if 'lora' in k]
-            if lora_skipped:
-                first_k = lora_skipped[0]
-                error_msg = (
-                    f"\n" + "!" * 80 + "\n"
-                    f"[LoRA Shape Mismatch Error] Loaded checkpoint has different LoRA dimensions than the model!\n"
-                    f"Skipped {len(lora_skipped)} LoRA parameters because of shape mismatch.\n"
-                    f"  Model layer expects shape: {model_state[first_k].shape}\n"
-                    f"  Checkpoint has shape:      {skipped_shapes[first_k]}\n"
-                    f"  First mismatch key:        {first_k}\n"
-                    f"Please update your config file (e.g. model.coupled_lora_cfg.r and alpha) to match the checkpoint.\n"
-                    f"!" * 80 + "\n"
-                )
-                raise RuntimeError(error_msg)
-            import logging
-            logger = logging.getLogger(__name__)
-            # 被跳过的参数全部属于同一个 head → 该 head 在前阶段必定是冻结的
-            # （Stage1 只训 OccHead，Stage2 只训 PlanningHead），
-            # shape 不匹配是预期行为，用 info；混合跳过才 warning
-            occ_skipped = [k for k in skipped if k.startswith('occ_head.')]
-            plan_skipped = [k for k in skipped if k.startswith('planning_head.')]
-            if bool(occ_skipped) != bool(plan_skipped):
-                head_name = 'OccHead' if occ_skipped else 'PlanningHead'
-                logger.info(
-                    f'Skipped {len(skipped)} untrained {head_name} LoRA params '
-                    f'(that head was frozen in the source checkpoint, '
-                    f'shape mismatch is expected). {head_name} LoRA will use fresh init.')
-            else:
-                logger.warning(
-                    f'Skipped {len(skipped)} LoRA params with shape mismatch '
-                    f'(e.g. different r/alpha). First: {skipped[0]}')
         return super().load_state_dict(state_dict, strict=False)
 
     @property
@@ -304,18 +286,13 @@ class UniAD(UniADTrack):
             torch.no_grad() if self.coupled_lora is not None
             else contextlib.nullcontext())
 
-        if stage1_only:
-            # 轻量级 BEV 特征提取（全程 no_grad，无 track decoder 计算）
-            bev_embed, bev_pos = self.extract_bev_only(img, img_metas)
-            outs_track = {"bev_embed": bev_embed, "bev_pos": bev_pos}
-        else:
-            with frozen_heads_ctx:
-                losses_track, outs_track = self.forward_track_train(
-                    img, gt_bboxes_3d, gt_labels_3d, gt_past_traj,
-                    gt_past_traj_mask, gt_inds, gt_sdc_bbox, gt_sdc_label,
-                    l2g_t, l2g_r_mat, img_metas, timestamp)
-            losses_track = self.loss_weighted_and_prefixed(losses_track, prefix='track')
-            monitoring_losses.update(losses_track)
+        with frozen_heads_ctx:
+            losses_track, outs_track = self.forward_track_train(
+                img, gt_bboxes_3d, gt_labels_3d, gt_past_traj,
+                gt_past_traj_mask, gt_inds, gt_sdc_bbox, gt_sdc_label,
+                l2g_t, l2g_r_mat, img_metas, timestamp)
+        losses_track = self.loss_weighted_and_prefixed(losses_track, prefix='track')
+        monitoring_losses.update(losses_track)
 
         # Upsample bev for tiny version
         outs_track = self.upsample_bev_if_tiny(outs_track)
@@ -326,7 +303,7 @@ class UniAD(UniADTrack):
         img_metas = [each[len_queue-1] for each in img_metas]
 
         outs_seg = dict()
-        if self.with_seg_head and not stage1_only:
+        if self.with_seg_head:
             with frozen_heads_ctx:
                 losses_seg, outs_seg = self.seg_head.forward_train(
                     bev_embed, img_metas,
@@ -336,17 +313,7 @@ class UniAD(UniADTrack):
 
         outs_motion = dict()
         # Forward Motion Head
-        if stage1_only:
-            # Stage 1: 跳过 MotionHead，用 dummy query 满足 OccHead 输入接口
-            B = bev_embed.shape[1]
-            outs_motion = dict(
-                track_query=torch.zeros((B, 1, 256), device=bev_embed.device),
-                track_query_pos=torch.zeros((B, 1, 256), device=bev_embed.device),
-                traj_query=torch.zeros((3, B, 1, 6, 256), device=bev_embed.device),
-                all_matched_idxes=[[-1]],
-                bev_pos=bev_pos,
-            )
-        elif self.with_motion_head:
+        if self.with_motion_head:
             with frozen_heads_ctx:
                 ret_dict_motion = self.motion_head.forward_train(
                     bev_embed,
