@@ -49,22 +49,24 @@ class CollisionLoss(nn.Module):
                 sdc_yaw = sdc_planning_gt[0, i, 2].to(sdc_traj_all.dtype)
                 sdc_bev_box = self.to_corners([sdc_traj_all[0, i, 0], sdc_traj_all[0, i, 1], self.w, self.h, sdc_yaw])
                 dump_sdc.append(sdc_bev_box.cpu().detach().numpy())
-                for j in range(future_gt_bbox_corners.shape[0]):
-                    inter_sum += self.inter_bbox(sdc_bev_box, future_gt_bbox_corners[j].to(sdc_traj_all.device))
+                
+                # 向量化并行计算碰撞面积，避免 CPU-GPU 同步瓶颈
+                corners_b_dev = future_gt_bbox_corners.to(sdc_traj_all.device)
+                xa1, ya1 = torch.max(sdc_bev_box[:, 0]), torch.max(sdc_bev_box[:, 1])
+                xa2, ya2 = torch.min(sdc_bev_box[:, 0]), torch.min(sdc_bev_box[:, 1])
+                
+                xb1 = torch.max(corners_b_dev[:, :, 0], dim=-1)[0]
+                yb1 = torch.max(corners_b_dev[:, :, 1], dim=-1)[0]
+                xb2 = torch.min(corners_b_dev[:, :, 0], dim=-1)[0]
+                yb2 = torch.min(corners_b_dev[:, :, 1], dim=-1)[0]
+                
+                xi1, yi1 = torch.minimum(xa1, xb1), torch.minimum(ya1, yb1)
+                xi2, yi2 = torch.maximum(xa2, xb2), torch.maximum(ya2, yb2)
+                
+                w_inter = torch.clamp(xi1 - xi2, min=0)
+                h_inter = torch.clamp(yi1 - yi2, min=0)
+                inter_sum += torch.sum(w_inter * h_inter)
         return inter_sum * self.weight
-        
-    def inter_bbox(self, corners_a, corners_b):
-        xa1, ya1 = torch.max(corners_a[:, 0]), torch.max(corners_a[:, 1])
-        xa2, ya2 = torch.min(corners_a[:, 0]), torch.min(corners_a[:, 1])
-        xb1, yb1 = torch.max(corners_b[:, 0]), torch.max(corners_b[:, 1])
-        xb2, yb2 = torch.min(corners_b[:, 0]), torch.min(corners_b[:, 1])
-        
-        xi1, yi1 = torch.minimum(xa1, xb1), torch.minimum(ya1, yb1)
-        xi2, yi2 = torch.maximum(xa2, xb2), torch.maximum(ya2, yb2)
-        
-        w_inter = torch.clamp(xi1 - xi2, min=0)
-        h_inter = torch.clamp(yi1 - yi2, min=0)
-        return w_inter * h_inter
 
     def to_corners(self, bbox):
         x, y, w, l, theta = bbox

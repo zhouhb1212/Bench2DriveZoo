@@ -124,17 +124,34 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
                         panoptic_metrics[key](result[0]['occ']['ins_seg_out'][..., limits, limits].contiguous().detach(),
                                                 result[0]['occ']['ins_seg_gt'][..., limits, limits].contiguous())
 
-            # Pop out unnecessary occ results, avoid appending it to cpu when collect_results_cpu
+            # Pop out unnecessary results to save memory, especially large segmentation probability maps and grids
             if os.environ.get('ENABLE_PLOT_MODE', None) is None:
-                result[0].pop('occ', None)
-                result[0].pop('planning', None)
+                # Keep only what is necessary for evaluation to save memory
+                keys_to_keep = ['boxes_3d', 'scores_3d', 'labels_3d', 'track_scores', 'track_ids', 
+                                'planning_traj', 'planning_traj_gt', 'command',
+                                'boxes_3d_det', 'scores_3d_det', 'labels_3d_det']
+                for res in result:
+                    res.pop('occ', None)
+                    res.pop('planning', None)
+                    for k in list(res.keys()):
+                        if k not in keys_to_keep:
+                            res.pop(k, None)
+                        else:
+                            if isinstance(res[k], torch.Tensor):
+                                res[k] = res[k].detach().cpu()
+                            elif hasattr(res[k], 'tensor') and isinstance(res[k].tensor, torch.Tensor):
+                                res[k].tensor = res[k].tensor.detach().cpu()
             else:
-                for k in ['seg_gt', 'ins_seg_gt', 'pred_ins_sigmoid', 'seg_out', 'ins_seg_out']:
-                    if k in result[0]['occ']:
-                        result[0]['occ'][k] = result[0]['occ'][k].detach().cpu()
-                for k in ['bbox', 'segm', 'labels', 'panoptic', 'drivable', 'score_list', 'lane', 'lane_score', 'stuff_score_list']:
-                    if k in result[0]['pts_bbox'] and isinstance(result[0]['pts_bbox'][k], torch.Tensor):
-                        result[0]['pts_bbox'][k] = result[0]['pts_bbox'][k].detach().cpu()
+                for res in result:
+                    if 'occ' in res and res['occ'] is not None:
+                        for k in ['seg_gt', 'ins_seg_gt', 'pred_ins_sigmoid', 'seg_out', 'ins_seg_out']:
+                            if k in res['occ']:
+                                res['occ'][k] = res['occ'][k].detach().cpu()
+                    for k in list(res.keys()):
+                        if isinstance(res[k], torch.Tensor):
+                            res[k] = res[k].detach().cpu()
+                        elif hasattr(res[k], 'tensor') and isinstance(res[k].tensor, torch.Tensor):
+                            res[k].tensor = res[k].tensor.detach().cpu()
 
             # # encode mask results
             if isinstance(result, dict):
