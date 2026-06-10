@@ -271,7 +271,12 @@ def main():
             runner._iter = 0
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
-    runner.run(data_loaders, cfg.workflow)
+
+    from mmcv.core.evaluation.eval_hooks import EarlyStoppingException
+    try:
+        runner.run(data_loaders, cfg.workflow)
+    except EarlyStoppingException as e:
+        logger.info(f'[EarlyStopping] Training stopped early: {e}')
 
 if __name__ == '__main__':
     main()

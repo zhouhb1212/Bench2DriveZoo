@@ -45,12 +45,16 @@ model = dict(
 # ── 优化器（仅 LoRA 参数 requires_grad=True，其余已冻结）──
 optimizer = dict(
     type="AdamW",
-    lr=3e-4,      # LoRA 推荐 LR 2e-4~1e-3，3e-4 是 Stage1 的验证值
+    lr=8e-5,      # LoRA 推荐 LR 2e-4~1e-3，根据 Stage 2 微调稳定性调整为 8e-5
     weight_decay=0.01,  # LoRA 参数少，0.01 避免衰减过强拉向零
 )
 
 # DDP 关闭 unused 参数检测，避免 allreduce 时梯度缓冲区未填充的错误
 find_unused_parameters = False
+
+# ── 验证集场景过滤配置 ──
+# 设为 None 则对全量验证集进行评估。设为特定的场景列表（如 ["ParkedObstacleTwoWays"]）则仅对该子集进行评估。
+eval_scenario_filter =  None # 可选：None / ["ParkedObstacleTwoWays"]
 
 # ── 过采样配置：针对特定场景做场景级过采样（LoRA 快速验证用）──
 data = dict(
@@ -61,9 +65,15 @@ data = dict(
             enable=True,                            # True 时启用
             scenarios=["ParkedObstacleTwoWays"],     # 要过采样的场景
             ratio=1,                                 # 额外复制轮数（总出现 = 1+ratio 次）
-            max_other_frames=15000,                  # 其他场景总帧数上限（所有场景全覆盖）
+            max_other_frames=25000,                  # 其他场景总帧数上限（所有场景全覆盖）
             seed=42,
         ),
+    ),
+    val=dict(
+        scenario_filter=eval_scenario_filter,
+    ),
+    test=dict(
+        scenario_filter=eval_scenario_filter,
     ),
 )
 
@@ -78,8 +88,18 @@ checkpoint_config = dict(
     # 文件命名：iter_3000.pth, iter_6000.pth, ...
     # epoch 结束时额外保存 epoch_1.pth
 )
-# 验证每 epoch 结束时执行一次（by_epoch=True, interval=1）
-evaluation = dict(interval=1, by_epoch=True)
+# 验证每 3000 iter 执行一次，支持自动早停保护
+evaluation = dict(
+    interval=3000,
+    by_epoch=False,
+    save_best='occ/iou_30x30',
+    rule='greater',
+    early_stopping=dict(
+        patience=2,
+        min_delta=0.05,
+        warmup_iters=9000,
+    )
+)
 log_config = dict(
     interval=10,
     hooks=[
@@ -104,7 +124,7 @@ lr_config = dict(
     by_epoch=False,               # 全局连续调度，不每 epoch 重置
     policy="CosineAnnealing",
     warmup="linear",
-    warmup_iters=200,             # 训练开始前 200 iter warmup
-    warmup_ratio=0.1,             # 从 0.1*peak 起步（3e-5）
-    min_lr_ratio=5e-2,            # 最终 lr 衰减到 peak 的 5%（1.5e-5），防止后期 delta 过小
+    warmup_iters=500,             # 训练开始前 500 iter warmup
+    warmup_ratio=0.1,             # 从 0.1*peak 起步
+    min_lr_ratio=5e-2,            # 最终 lr 衰减到 peak 的 5%，防止后期 delta 过小
 )

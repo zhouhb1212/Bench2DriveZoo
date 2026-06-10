@@ -22,7 +22,7 @@ class PlanningLoss(nn.Module):
         err = sdc_traj[..., :2] - gt_sdc_fut_traj[..., :2]
         err = torch.pow(err, exponent=2)
         err = torch.sum(err, dim=-1)
-        err = torch.pow(err, exponent=0.5)
+        err = torch.pow(err + 1e-7, exponent=0.5)
         return torch.sum(err * mask)/(torch.sum(mask) + 1e-5)
 
 

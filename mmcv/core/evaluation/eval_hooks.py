@@ -49,10 +49,73 @@ def _check_system_memory(min_free_gb=8):
         return True, float('inf'), float('inf')
 
 
+class EarlyStoppingException(Exception):
+    """Exception raised when training is terminated early by evaluation hook."""
+    pass
+
+
+def init_early_stopping(hook, early_stopping):
+    hook.early_stopping = early_stopping
+    if hook.early_stopping is not None:
+        hook.patience = hook.early_stopping.get('patience', 3)
+        hook.min_delta = hook.early_stopping.get('min_delta', 0.0)
+        hook.warmup_iters = hook.early_stopping.get('warmup_iters', 0)
+        hook.patience_counter = 0
+        hook.best_score = None
+        # Ensure save_best is set if not already set
+        if getattr(hook, 'save_best', None) is None:
+            hook.save_best = hook.early_stopping.get('metric', 'occ/iou_30x30')
+            hook.rule = hook.early_stopping.get('rule', 'greater')
+            hook._init_rule(hook.rule, hook.save_best)
+
+
+def check_early_stopping(hook, runner, key_score):
+    if hook.early_stopping is None or key_score is None:
+        return False
+    current_iter = runner.iter
+    if current_iter < hook.warmup_iters:
+        runner.logger.info(
+            f'[EarlyStopping] Warmup active: iteration {current_iter}/{hook.warmup_iters}. Skipping check.')
+        return False
+
+    runner.logger.info(
+        f'[EarlyStopping] Checking metric {hook.save_best} (current={key_score:.4f}, best={hook.best_score})')
+    if hook.best_score is None:
+        hook.best_score = key_score
+        hook.patience_counter = 0
+        return False
+
+    if hook.rule == 'greater':
+        improved = key_score > hook.best_score + hook.min_delta
+    else:
+        improved = key_score < hook.best_score - hook.min_delta
+
+    if improved:
+        runner.logger.info(
+            f'[EarlyStopping] Metric improved from {hook.best_score:.4f} to {key_score:.4f}. Resetting patience.')
+        hook.best_score = key_score
+        hook.patience_counter = 0
+        return False
+    else:
+        hook.patience_counter += 1
+        runner.logger.info(
+            f'[EarlyStopping] No improvement. Patience counter: {hook.patience_counter}/{hook.patience}.')
+        if hook.patience_counter >= hook.patience:
+            runner.logger.info(
+                f'[EarlyStopping] Early stopping triggered! Best score: {hook.best_score:.4f} at iter {runner.iter + 1}')
+            return True
+    return False
+
+
 class EvalHook(BaseEvalHook):
+
+    def __init__(self, *args, early_stopping=None, **kwargs):
+        super(EvalHook, self).__init__(*args, **kwargs)
+        init_early_stopping(self, early_stopping)
 
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
+        should_stop = False
         try:
             if not self._should_evaluate(runner):
                 return
@@ -73,6 +136,10 @@ class EvalHook(BaseEvalHook):
                 key_score = self.evaluate(runner, results)
                 if self.save_best:
                     self._save_ckpt(runner, key_score)
+                if hasattr(self, 'early_stopping') and self.early_stopping is not None:
+                    should_stop = check_early_stopping(self, runner, key_score)
+        except EarlyStoppingException:
+            raise
         except Exception:
             _cleanup_memory()
             runner.logger.error(
@@ -81,12 +148,19 @@ class EvalHook(BaseEvalHook):
             runner.logger.warning(
                 '[Validation] Validation failed, skipping and continuing '
                 'training...')
+        if should_stop:
+            raise EarlyStoppingException(f"Early stopped at iter {runner.iter + 1}")
 
 
 class DistEvalHook(BaseDistEvalHook):
 
+    def __init__(self, *args, early_stopping=None, **kwargs):
+        super(DistEvalHook, self).__init__(*args, **kwargs)
+        init_early_stopping(self, early_stopping)
+
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
+        should_stop = False
         try:
             # Synchronization of BatchNorm's buffer (running_mean
             # and running_var) is not supported in the DDP of pytorch,
@@ -132,6 +206,10 @@ class DistEvalHook(BaseDistEvalHook):
                     key_score = self.evaluate(runner, results)
                     if self.save_best:
                         self._save_ckpt(runner, key_score)
+                    if hasattr(self, 'early_stopping') and self.early_stopping is not None:
+                        should_stop = check_early_stopping(self, runner, key_score)
+        except EarlyStoppingException:
+            raise
         except Exception:
             _cleanup_memory()
             if runner.rank == 0:
@@ -141,6 +219,16 @@ class DistEvalHook(BaseDistEvalHook):
                 runner.logger.warning(
                     '[Validation] Validation failed, skipping and continuing '
                     'training...')
+
+        if hasattr(self, 'early_stopping') and self.early_stopping is not None:
+            if dist.is_available() and dist.is_initialized():
+                stop_tensor = torch.tensor([1 if should_stop else 0], dtype=torch.int32, device='cuda')
+                dist.broadcast(stop_tensor, src=0)
+                if stop_tensor.item() == 1:
+                    should_stop = True
+            if should_stop:
+                raise EarlyStoppingException(f"Early stopped at iter {runner.iter + 1}")
+
 
 def _calc_dynamic_intervals(start_interval, dynamic_interval_list):
     assert is_list_of(dynamic_interval_list, tuple)
@@ -156,12 +244,13 @@ def _calc_dynamic_intervals(start_interval, dynamic_interval_list):
 
 class CustomDistEvalHook(BaseDistEvalHook):
 
-    def __init__(self, *args, dynamic_intervals=None,  **kwargs):
+    def __init__(self, *args, dynamic_intervals=None, early_stopping=None,  **kwargs):
         super(CustomDistEvalHook, self).__init__(*args, **kwargs)
         self.use_dynamic_intervals = dynamic_intervals is not None
         if self.use_dynamic_intervals:
             self.dynamic_milestones, self.dynamic_intervals = \
                 _calc_dynamic_intervals(self.interval, dynamic_intervals)
+        init_early_stopping(self, early_stopping)
 
     def _decide_interval(self, runner):
         if self.use_dynamic_intervals:
@@ -181,6 +270,7 @@ class CustomDistEvalHook(BaseDistEvalHook):
 
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
+        should_stop = False
         try:
             # Synchronization of BatchNorm's buffer (running_mean
             # and running_var) is not supported in the DDP of pytorch,
@@ -245,6 +335,10 @@ class CustomDistEvalHook(BaseDistEvalHook):
 
                     if self.save_best:
                         self._save_ckpt(runner, key_score)
+                    if hasattr(self, 'early_stopping') and self.early_stopping is not None:
+                        should_stop = check_early_stopping(self, runner, key_score)
+        except EarlyStoppingException:
+            raise
         except Exception:
             _cleanup_memory()
             if runner.rank == 0:
@@ -254,3 +348,12 @@ class CustomDistEvalHook(BaseDistEvalHook):
                 runner.logger.warning(
                     '[Validation] Validation failed, skipping and continuing '
                     'training...')
+
+        if hasattr(self, 'early_stopping') and self.early_stopping is not None:
+            if dist.is_available() and dist.is_initialized():
+                stop_tensor = torch.tensor([1 if should_stop else 0], dtype=torch.int32, device='cuda')
+                dist.broadcast(stop_tensor, src=0)
+                if stop_tensor.item() == 1:
+                    should_stop = True
+            if should_stop:
+                raise EarlyStoppingException(f"Early stopped at iter {runner.iter + 1}")

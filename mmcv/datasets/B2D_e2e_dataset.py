@@ -26,7 +26,7 @@ from prettytable import PrettyTable
 
 @DATASETS.register_module()
 class B2D_E2E_Dataset(Custom3DDataset):
-    def __init__(self, queue_length=4, bev_size=(200, 200),overlap_test=False,with_velocity=True,sample_interval=5,name_mapping= None,eval_cfg = None, map_root =None,map_file=None,past_frames=4, future_frames=4,predict_frames=12,planning_frames=6,patch_size = [102.4, 102.4],point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] ,occ_receptive_field=3,occ_n_future=6,occ_filter_invalid_sample=False,occ_filter_by_valid_flag=False,eval_mod=None, oversample_cfg=None, *args, **kwargs):
+    def __init__(self, queue_length=4, bev_size=(200, 200),overlap_test=False,with_velocity=True,sample_interval=5,name_mapping= None,eval_cfg = None, map_root =None,map_file=None,past_frames=4, future_frames=4,predict_frames=12,planning_frames=6,patch_size = [102.4, 102.4],point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] ,occ_receptive_field=3,occ_n_future=6,occ_filter_invalid_sample=False,occ_filter_by_valid_flag=False,eval_mod=None, oversample_cfg=None, scenario_filter=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.queue_length = queue_length
         self.bev_size = (200, 200)
@@ -49,9 +49,11 @@ class B2D_E2E_Dataset(Custom3DDataset):
         self.occ_filter_by_valid_flag = occ_filter_by_valid_flag
         self.occ_only_total_frames = 7  # NOTE: hardcode, not influenced by planning   
         self.eval_mod = eval_mod     
+        self.scenario_filter = scenario_filter
         self.map_element_class = {'Broken':0, 'Solid':1, 'SolidSolid':2,'Center':3,'TrafficLight':4,'StopSign':5}
         with open(self.map_file,'rb') as f:
             self.map_infos = pickle.load(f)
+        self._apply_scenario_filter(scenario_filter)
         self._apply_oversample(oversample_cfg)
 
     @staticmethod
@@ -109,7 +111,7 @@ class B2D_E2E_Dataset(Custom3DDataset):
         for frames in target_groups.values():
             new_data_infos.extend(frames)
 
-        # 3. 其他场景：每类取最长子路线的 chunk，全覆盖，总帧数 ≤ max_other_frames
+        # 3. 其他场景：从所有可用的子路线中随机/均匀采样 chunks，保证地理背景泛化覆盖
         chunk_size = self.queue_length * self.sample_interval + 1
         n_other = len(other_by_type)
 
@@ -118,16 +120,50 @@ class B2D_E2E_Dataset(Custom3DDataset):
         frames_per_type = budget // n_other
         chunks_per_type = max(1, frames_per_type // chunk_size)
 
+        import random
+        # 保证采样结果确定可复现
+        rng = random.Random(oversample_cfg.get('seed', 42))
+
         for scenario, folder_groups in other_by_type.items():
-            # 取该场景类型中帧最多的子路线（保证 chunk 不跨越子路线边界）
-            longest_folder = max(folder_groups, key=lambda f: len(folder_groups[f]))
-            frames = folder_groups[longest_folder]
-            n_chunks = min(chunks_per_type, len(frames) // chunk_size)
-            if n_chunks == 0:
-                continue
-            for c in range(n_chunks):
-                start = c * (len(frames) // n_chunks)
-                new_data_infos.extend(frames[start:start + chunk_size])
+            # 过滤可用帧数小于 chunk_size 的 routes
+            valid_folders = []
+            for folder, frames in folder_groups.items():
+                if len(frames) >= chunk_size:
+                    valid_folders.append((folder, frames))
+            
+            if not valid_folders:
+                # 备选：如果所有路线的帧数都不足 chunk_size，退回 longest_folder 提取 1 个 chunk
+                longest_folder = max(folder_groups, key=lambda f: len(folder_groups[f]))
+                frames = folder_groups[longest_folder]
+                valid_folders = [(longest_folder, frames)]
+
+            # 随机打乱以确保路线级别的均匀采样
+            rng.shuffle(valid_folders)
+
+            n_folders = len(valid_folders)
+            chunks_allocated = [0] * n_folders
+            for i in range(chunks_per_type):
+                chunks_allocated[i % n_folders] += 1
+
+            for i, (folder, frames) in enumerate(valid_folders):
+                alloc = chunks_allocated[i]
+                if alloc == 0:
+                    continue
+                max_chunks_possible = len(frames) // chunk_size
+                use_alloc = min(alloc, max_chunks_possible)
+                if use_alloc == 0:
+                    use_alloc = 1
+                
+                # 在此子路线路线区间内划分为 use_alloc 份，每份抽取一个 chunk 保证时序分布
+                section_len = len(frames) // use_alloc
+                for c in range(use_alloc):
+                    start_min = c * section_len
+                    start_max = (c + 1) * section_len - chunk_size
+                    if start_max >= start_min:
+                        start = rng.randint(start_min, start_max)
+                    else:
+                        start = start_min
+                    new_data_infos.extend(frames[start:start + chunk_size])
 
         # 4. 过采样：目标场景帧复制 ratio 份
         all_target_frames = [item for frames in target_groups.values()
@@ -138,6 +174,26 @@ class B2D_E2E_Dataset(Custom3DDataset):
 
         self.data_infos = new_data_infos
         # 重建 group flag，使 DistributedGroupSampler 的索引与新 data_infos 大小一致
+        if not self.test_mode:
+            self._set_group_flag()
+
+    def _apply_scenario_filter(self, scenario_filter):
+        """仅保留指定场景的帧，创建测试/验证子集以防止信息泄露。"""
+        if scenario_filter is None:
+            return
+
+        if isinstance(scenario_filter, str):
+            scenario_filter = [scenario_filter]
+
+        new_data_infos = []
+        for item in self.data_infos:
+            folder = item['folder']
+            scenario = self._extract_scenario(folder)
+            if any(s in scenario for s in scenario_filter):
+                new_data_infos.append(item)
+
+        print(f"[ScenarioFilter] Filtered dataset from {len(self.data_infos)} frames to {len(new_data_infos)} frames using filter: {scenario_filter}")
+        self.data_infos = new_data_infos
         if not self.test_mode:
             self._set_group_flag()
 

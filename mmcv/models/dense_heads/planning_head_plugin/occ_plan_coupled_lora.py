@@ -60,14 +60,11 @@ class OccPlanCoupledLoRA:
     # ------------------------------------------------------------------#
 
     def inject(self):
-        """根据当前训练阶段执行按需 LoRA 注入。必须在模型初始化后、训练前调用一次。"""
+        """同时注入 OccHead 和 PlanningHead 的 LoRA 结构。"""
         if self._injected:
             return
-        stage = self.lora_cfg.get('training_stage', 1)
-        if stage == 1:
-            self._inject_occ_head()
-        elif stage == 2:
-            self._inject_planning_head()
+        self._inject_occ_head()
+        self._inject_planning_head()
         self._injected = True
         self._freeze_all()
 
