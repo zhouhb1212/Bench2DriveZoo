@@ -14,7 +14,10 @@ from torch.nn.modules.batchnorm import _BatchNorm
 
 def _cleanup_memory(runner=None):
     """Release GPU and CPU memory before/after validation."""
-    gc.collect()
+    import gc
+    import torch
+    for _ in range(3):
+        gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
@@ -66,6 +69,17 @@ def init_early_stopping(hook, early_stopping):
         if getattr(hook, 'save_best', None) is None:
             hook.save_best = hook.early_stopping.get('metric', 'occ/iou_30x30')
             hook.rule = hook.early_stopping.get('rule', 'greater')
+        
+        # Handle custom metrics mapping manually to bypass MMCV's default _init_rule
+        if hook.save_best == 'composite_iou_pq':
+            hook.rule = 'greater'
+            hook.compare_func = hook.rule_map[hook.rule]
+            hook.key_indicator = hook.save_best
+        elif hook.save_best == 'plan_l2_avg':
+            hook.rule = 'less'
+            hook.compare_func = hook.rule_map[hook.rule]
+            hook.key_indicator = hook.save_best
+        else:
             hook._init_rule(hook.rule, hook.save_best)
 
 
@@ -107,11 +121,55 @@ def check_early_stopping(hook, runner, key_score):
     return False
 
 
+def evaluate_with_composite(hook, runner, results):
+    eval_res = hook.dataloader.dataset.evaluate(
+        results, logger=runner.logger, **hook.eval_kwargs)
+
+    for name, val in eval_res.items():
+        runner.log_buffer.output[name] = val
+    runner.log_buffer.ready = True
+
+    if hook.save_best is not None:
+        if hook.key_indicator == 'composite_iou_pq':
+            iou = eval_res.get('occ/iou_30x30', 0.0)
+            pq = eval_res.get('occ/pq_30x30', 0.0)
+            composite_score = 0.5 * iou + 0.5 * pq
+            runner.log_buffer.output['composite_iou_pq'] = composite_score
+            return composite_score
+
+        if hook.key_indicator == 'plan_l2_avg':
+            l2_keys = [f'planning/L2_{i*0.5:.1f}s' for i in range(1, 7)]
+            l2_values = [eval_res.get(k, 0.0) for k in l2_keys if k in eval_res]
+            if l2_values:
+                avg_l2 = sum(l2_values) / len(l2_values)
+                runner.log_buffer.output['plan_l2_avg'] = avg_l2
+                return avg_l2
+            else:
+                runner.logger.warning('[EarlyStopping] plan_l2_avg requested but no planning L2 metrics found!')
+                return 0.0
+
+        if not eval_res:
+            import warnings
+            warnings.warn(
+                'Since `eval_res` is an empty dict, the behavior to save '
+                'the best checkpoint will be skipped in this evaluation.')
+            return None
+
+        if hook.key_indicator == 'auto':
+            hook._init_rule(hook.rule, list(eval_res.keys())[0])
+        return eval_res[hook.key_indicator]
+
+    return None
+
+
 class EvalHook(BaseEvalHook):
 
     def __init__(self, *args, early_stopping=None, **kwargs):
         super(EvalHook, self).__init__(*args, **kwargs)
         init_early_stopping(self, early_stopping)
+
+    def evaluate(self, runner, results):
+        return evaluate_with_composite(self, runner, results)
 
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
@@ -123,8 +181,13 @@ class EvalHook(BaseEvalHook):
             _cleanup_memory()
             results = self.test_fn(runner.model, self.dataloader, show=False)
             runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
+            _cleanup_memory()
+
+            dataset = getattr(self.dataloader, 'dataset', None)
+            scenario_filter = getattr(dataset, 'scenario_filter', None)
+            default_min_ram = '2' if scenario_filter is not None else '8'
             min_free_ram_gb = float(
-                os.environ.get('B2D_EVAL_MIN_FREE_RAM_GB', '8'))
+                os.environ.get('B2D_EVAL_MIN_FREE_RAM_GB', default_min_ram))
             ram_ok, free_ram_gb, total_ram_gb = _check_system_memory(min_free_ram_gb)
             if not ram_ok:
                 runner.logger.warning(
@@ -157,6 +220,9 @@ class DistEvalHook(BaseDistEvalHook):
     def __init__(self, *args, early_stopping=None, **kwargs):
         super(DistEvalHook, self).__init__(*args, **kwargs)
         init_early_stopping(self, early_stopping)
+
+    def evaluate(self, runner, results):
+        return evaluate_with_composite(self, runner, results)
 
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
@@ -193,8 +259,11 @@ class DistEvalHook(BaseDistEvalHook):
                 print('\n')
                 runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
 
+                dataset = getattr(self.dataloader, 'dataset', None)
+                scenario_filter = getattr(dataset, 'scenario_filter', None)
+                default_min_ram = '2' if scenario_filter is not None else '8'
                 min_free_ram_gb = float(
-                    os.environ.get('B2D_EVAL_MIN_FREE_RAM_GB', '8'))
+                    os.environ.get('B2D_EVAL_MIN_FREE_RAM_GB', default_min_ram))
                 ram_ok, free_ram_gb, total_ram_gb = _check_system_memory(min_free_ram_gb)
                 if not ram_ok:
                     runner.logger.warning(
@@ -251,6 +320,10 @@ class CustomDistEvalHook(BaseDistEvalHook):
             self.dynamic_milestones, self.dynamic_intervals = \
                 _calc_dynamic_intervals(self.interval, dynamic_intervals)
         init_early_stopping(self, early_stopping)
+
+    def evaluate(self, runner, results):
+        return evaluate_with_composite(self, runner, results)
+
 
     def _decide_interval(self, runner):
         if self.use_dynamic_intervals:
@@ -321,8 +394,11 @@ class CustomDistEvalHook(BaseDistEvalHook):
                 print('\n')
                 runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
 
+                dataset = getattr(self.dataloader, 'dataset', None)
+                scenario_filter = getattr(dataset, 'scenario_filter', None)
+                default_min_ram = '2' if scenario_filter is not None else '8'
                 min_free_ram_gb = float(
-                    os.environ.get('B2D_EVAL_MIN_FREE_RAM_GB', '8'))
+                    os.environ.get('B2D_EVAL_MIN_FREE_RAM_GB', default_min_ram))
                 ram_ok, free_ram_gb, total_ram_gb = _check_system_memory(min_free_ram_gb)
                 if not ram_ok:
                     runner.logger.warning(

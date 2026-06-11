@@ -13,7 +13,7 @@
 _base_ = ["./base_e2e_b2d.py"]
 
 # 预训练权重（包含 Stage1 Track+Map + Stage2 E2E 完整权重）
-load_from = "ckpts/uniad_base_b2d.pth"
+load_from = "adzoo/uniad/work_dirs/stage2_e2e/base_e2e_b2d_lora/corrupted_checkpoints/SOTA0.4r=16stage1/iter_15000.pth"
 
 # ── Occupancy-Planning Coupled LoRA 配置 ──
 model = dict(
@@ -31,7 +31,7 @@ model = dict(
         planning_lora=dict(r=8, alpha=8),    # Stage 2 PlanningHead 微调容量
         inject_q2o_feat=True,  # 向 query_to_occ_feat 注入 LoRA；False 用于消融/旧权重兼容
         pretrained_path="ckpts/uniad_base_b2d.pth",
-        training_stage=1,  # 切换阶段：1 / 2
+        training_stage=2,  # 切换阶段：1 / 2
     ),
     task_loss_weight=dict(
         track=1.0,
@@ -45,16 +45,16 @@ model = dict(
 # ── 优化器（仅 LoRA 参数 requires_grad=True，其余已冻结）──
 optimizer = dict(
     type="AdamW",
-    lr=8e-5,      # LoRA 推荐 LR 2e-4~1e-3，根据 Stage 2 微调稳定性调整为 8e-5
+    lr=2e-4,      # 提高 LR 至 2e-4 以加速收敛
     weight_decay=0.01,  # LoRA 参数少，0.01 避免衰减过强拉向零
 )
 
-# DDP 关闭 unused 参数检测，避免 allreduce 时梯度缓冲区未填充的错误
+# DDP 关闭 unused 参数检测，避免 allreduce 时梯度缓冲区未填充 of 错误
 find_unused_parameters = False
 
 # ── 验证集场景过滤配置 ──
 # 设为 None 则对全量验证集进行评估。设为特定的场景列表（如 ["ParkedObstacleTwoWays"]）则仅对该子集进行评估。
-eval_scenario_filter =  None # 可选：None / ["ParkedObstacleTwoWays"]
+eval_scenario_filter =  ["ParkedObstacleTwoWays"] # 可选：None / ["ParkedObstacleTwoWays"]
 
 # ── 过采样配置：针对特定场景做场景级过采样（LoRA 快速验证用）──
 data = dict(
@@ -65,7 +65,7 @@ data = dict(
             enable=True,                            # True 时启用
             scenarios=["ParkedObstacleTwoWays"],     # 要过采样的场景
             ratio=1,                                 # 额外复制轮数（总出现 = 1+ratio 次）
-            max_other_frames=25000,                  # 其他场景总帧数上限（所有场景全覆盖）
+            max_other_frames=5000,                  # 其他场景总帧数上限（从 25000 缩减至 5000 以缩减 Epoch 大小）
             seed=42,
         ),
     ),
@@ -89,11 +89,10 @@ checkpoint_config = dict(
     # epoch 结束时额外保存 epoch_1.pth
 )
 # 验证每 3000 iter 执行一次，支持自动早停保护
+# 注：save_best 与 rule 已由 train.py 依据训练阶段（Stage 1 或 2）动态自适应注入
 evaluation = dict(
     interval=3000,
     by_epoch=False,
-    save_best='occ/iou_30x30',
-    rule='greater',
     early_stopping=dict(
         patience=2,
         min_delta=0.05,
@@ -114,7 +113,7 @@ log_config = dict(
 optimizer_config = dict(
     type='GradientCumulativeFp16OptimizerHook',
     cumulative_iters=2,  # 累积 2 步：每个 GPU 的 samples_per_gpu 为 1，累积 2 步达到有效 batch_size=2
-    grad_clip=dict(max_norm=2.0, norm_type=2),  # LoRA 稳定 grad_norm ~0.8-1.1，2.0 过滤异常梯度
+    grad_clip=dict(max_norm=1.0, norm_type=2),  # 收紧梯度裁剪至 1.0，减缓碰撞损失的高梯度冲击
 )
 
 # ── 学习率调度（全局 cosine，跨 epoch 连续）──

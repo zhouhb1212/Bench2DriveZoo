@@ -150,8 +150,9 @@ class TextLoggerHook(LoggerHook):
                 eta_sec = time_sec_avg * (runner.max_iters - runner.iter - 1)
                 eta_str = str(datetime.timedelta(seconds=int(eta_sec)))
                 log_str += f'eta: {eta_str}, '
-                log_str += f'time: {log_dict["time"]:.3f}, ' \
-                           f'data_time: {log_dict["data_time"]:.3f}, '
+                log_str += f'time: {log_dict["time"]:.3f}, '
+                if 'data_time' in log_dict:
+                    log_str += f'data_time: {log_dict["data_time"]:.3f}, '
                 # statistic memory
                 if torch.cuda.is_available():
                     log_str += f'memory: {log_dict["memory"]}, '

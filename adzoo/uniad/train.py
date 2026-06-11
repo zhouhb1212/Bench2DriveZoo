@@ -113,6 +113,12 @@ def main():
     if args.lr is not None:
         cfg.optimizer['lr'] = args.lr
 
+    # 根据 training_stage 划分 work_dir 子文件夹 (stage1/stage2)
+    if 'coupled_lora_cfg' in cfg.model:
+        training_stage = cfg.model['coupled_lora_cfg'].get('training_stage', None)
+        if training_stage in [1, 2]:
+            cfg.work_dir = osp.join(cfg.work_dir, f'stage{training_stage}')
+
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':
         distributed = False
@@ -246,6 +252,17 @@ def main():
         eval_cfg.setdefault('by_epoch', cfg.runner['type'] != 'IterBasedRunner')
         lora_stage = cfg.model.get('coupled_lora_cfg', {}).get('training_stage', None)
         eval_cfg['lora_stage'] = lora_stage
+
+        # 根据微调阶段（Stage 1 或 Stage 2）动态调整验证的最佳指标和早停规则
+        if lora_stage == 1:
+            eval_cfg['save_best'] = 'composite_iou_pq'
+            eval_cfg['rule'] = 'greater'
+            logger.info("[LoRA Stage 1] Early stopping monitored metric: composite_iou_pq (greater is better)")
+        elif lora_stage == 2:
+            eval_cfg['save_best'] = 'plan_l2_avg'
+            eval_cfg['rule'] = 'less'
+            logger.info("[LoRA Stage 2] Early stopping monitored metric: plan_l2_avg (less is better)")
+
         # 验证结果保存到 work_dir/val/<timestamp>/ 下，使用绝对路径避免 cwd 依赖
         eval_cfg['jsonfile_prefix'] = osp.join(
             osp.abspath(cfg.work_dir), 'val',

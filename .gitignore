@@ -141,6 +141,7 @@ logs/
 test/
 ckpts/
 ckpts
+output
 
 # work_dirs
 **/work_dirs
@@ -160,3 +161,4 @@ tmp_ckpts/
 val/
 *.ipynb
 CLAUDE.md
+
