@@ -939,6 +939,21 @@ class B2D_E2E_Dataset(Custom3DDataset):
                     print("  [Warning] Planning results not found in evaluation outputs!")
             print("=" * 60 + "\n")
 
+        # 自定义保存验证结果到 val/<timestamp>/iter_<step>.txt
+        val_dir = kwargs.get('val_dir', None)
+        runner = kwargs.get('runner', None)
+        if val_dir is not None and runner is not None:
+            cur_iter = runner.iter + 1
+            os.makedirs(val_dir, exist_ok=True)
+            txt_path = os.path.join(val_dir, f'iter_{cur_iter}.txt')
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                if 'occ_results_computed' in results.keys() and 'occ_tab' in locals():
+                    f.write("Occupancy Evaluation Results:\n")
+                    f.write(str(occ_tab) + "\n\n")
+                if 'planning_results_computed' in results.keys() and 'planning_tab' in locals():
+                    f.write("Planning Evaluation Results:\n")
+                    f.write(str(planning_tab) + "\n")
+
         return detail
 
     def load_gt(self):

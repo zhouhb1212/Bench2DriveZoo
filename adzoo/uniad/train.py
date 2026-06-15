@@ -264,9 +264,11 @@ def main():
             logger.info("[LoRA Stage 2] Early stopping monitored metric: plan_l2_avg (less is better)")
 
         # 验证结果保存到 work_dir/val/<timestamp>/ 下，使用绝对路径避免 cwd 依赖
+        val_timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
         eval_cfg['jsonfile_prefix'] = osp.join(
-            osp.abspath(cfg.work_dir), 'val',
-            time.strftime('%Y%m%d_%H%M%S', time.localtime()))
+            osp.abspath(cfg.work_dir), 'val', val_timestamp)
+        eval_cfg['val_dir'] = osp.join(
+            osp.abspath(cfg.work_dir), 'val', val_timestamp)
         eval_hook = CustomDistEvalHook if distributed else EvalHook
         runner.register_hook(eval_hook(val_dataloader, test_fn=custom_multi_gpu_test, **eval_cfg))
     else:

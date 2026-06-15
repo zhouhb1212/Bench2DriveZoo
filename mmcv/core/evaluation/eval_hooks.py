@@ -123,7 +123,7 @@ def check_early_stopping(hook, runner, key_score):
 
 def evaluate_with_composite(hook, runner, results):
     eval_res = hook.dataloader.dataset.evaluate(
-        results, logger=runner.logger, **hook.eval_kwargs)
+        results, logger=runner.logger, runner=runner, **hook.eval_kwargs)
 
     for name, val in eval_res.items():
         runner.log_buffer.output[name] = val
