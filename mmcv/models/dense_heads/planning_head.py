@@ -24,6 +24,7 @@ class PlanningHeadSingleMode(nn.Module):
                  command_dim=3,
                  loss_planning=None,
                  loss_collision=None,
+                 loss_direction=None,
                  planning_eval=False,
                  use_col_optim=False,
                  col_optim_args=dict(
@@ -60,6 +61,10 @@ class PlanningHeadSingleMode(nn.Module):
             nn.Linear(embed_dims, planning_steps * 2),
         )
         self.loss_planning = build_loss(loss_planning)
+        if loss_direction is not None:
+            self.loss_direction = build_loss(loss_direction)
+        else:
+            self.loss_direction = None
         self.planning_steps = planning_steps
         self.planning_eval = planning_eval
         
@@ -194,9 +199,11 @@ class PlanningHeadSingleMode(nn.Module):
         # bev_feat: [40000, 1, 256]
         plan_query = self.attn_module(plan_query, bev_feat)   # [1, 1, 256]
 
-        sdc_traj_all = self.reg_branch(plan_query).view((-1, self.planning_steps, 2))
-        sdc_traj_all[...,:2] = torch.cumsum(sdc_traj_all[...,:2], dim=1)
-        sdc_traj_all[0] = bivariate_gaussian_activation(sdc_traj_all[0])
+        raw_output = self.reg_branch(plan_query).view((-1, self.planning_steps, 2))
+        sdc_traj_all = torch.cumsum(raw_output, dim=1)
+        # bivariate_gaussian_activation 对 (B, T, 2) 输入是 identity（仅取 mu_x, mu_y），
+        # 保留调用以兼容未来 output dim 变化
+        sdc_traj_all = bivariate_gaussian_activation(sdc_traj_all)
 
         if self.use_col_optim and not self.training:
             # post process, only used when testing
@@ -256,6 +263,9 @@ class PlanningHeadSingleMode(nn.Module):
             loss_dict[f'loss_collision_{i}'] = loss_collision          
         loss_ade = self.loss_planning(sdc_traj_all, sdc_planning[0, :, :self.planning_steps, :2], torch.any(sdc_planning_mask[0, :, :self.planning_steps], dim=-1))
         loss_dict.update(dict(loss_ade=loss_ade))
+        if hasattr(self, 'loss_direction') and self.loss_direction is not None:
+            loss_dir = self.loss_direction(sdc_traj_all, sdc_planning[0, :, :self.planning_steps, :2], torch.any(sdc_planning_mask[0, :, :self.planning_steps], dim=-1))
+            loss_dict.update(dict(loss_dir=loss_dir))
 
         return loss_dict
 

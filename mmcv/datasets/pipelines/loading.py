@@ -1322,6 +1322,16 @@ class LoadAnnotations3D_E2E(LoadAnnotations3D):
         if 'occ_future_ann_infos_for_plan' in results.keys():
             results = self._load_future_anns_plan(results)
         
+        # Extract gt_fut_traj from ann_info for motion evaluation
+        # (In train pipeline this is done by ObjectRangeFilterTrack,
+        #  but test pipeline doesn't have that transform)
+        if 'ann_info' in results:
+            ann_info = results['ann_info']
+            if 'gt_fut_traj' in ann_info and 'gt_fut_traj' not in results:
+                results['gt_fut_traj'] = ann_info['gt_fut_traj']
+            if 'gt_fut_traj_mask' in ann_info and 'gt_fut_traj_mask' not in results:
+                results['gt_fut_traj_mask'] = ann_info['gt_fut_traj_mask']
+
         return results
 
     def __repr__(self):

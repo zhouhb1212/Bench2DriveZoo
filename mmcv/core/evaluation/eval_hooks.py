@@ -65,25 +65,96 @@ def init_early_stopping(hook, early_stopping):
         hook.warmup_iters = hook.early_stopping.get('warmup_iters', 0)
         hook.patience_counter = 0
         hook.best_score = None
-        # Ensure save_best is set if not already set
-        if getattr(hook, 'save_best', None) is None:
-            hook.save_best = hook.early_stopping.get('metric', 'occ/iou_30x30')
-            hook.rule = hook.early_stopping.get('rule', 'greater')
-        
-        # Handle custom metrics mapping manually to bypass MMCV's default _init_rule
-        if hook.save_best == 'composite_iou_pq':
-            hook.rule = 'greater'
-            hook.compare_func = hook.rule_map[hook.rule]
-            hook.key_indicator = hook.save_best
-        elif hook.save_best == 'plan_l2_avg':
-            hook.rule = 'less'
-            hook.compare_func = hook.rule_map[hook.rule]
-            hook.key_indicator = hook.save_best
+        hook._early_stop_resolved = False  # Flag for lazy resolution of 'auto'
+
+        metric = hook.early_stopping.get('metric', 'occ/iou_30x30')
+        rule = hook.early_stopping.get('rule', 'greater')
+
+        if metric == 'auto' or rule == 'auto':
+            # Defer resolution until first evaluate call when runner is available
+            hook._early_stop_resolved = False
+            # Set temporary defaults to avoid errors
+            hook.save_best = None
+            hook.rule = None
+            hook.key_indicator = None
         else:
-            hook._init_rule(hook.rule, hook.save_best)
+            hook._early_stop_resolved = True
+            # Ensure save_best is set if not already set
+            if getattr(hook, 'save_best', None) is None:
+                hook.save_best = metric
+                hook.rule = rule
+
+            # Handle custom metrics mapping manually to bypass MMCV's default _init_rule
+            if hook.save_best == 'composite_iou_pq':
+                hook.rule = 'greater'
+                hook.compare_func = hook.rule_map[hook.rule]
+                hook.key_indicator = hook.save_best
+            elif hook.save_best == 'plan_l2_avg':
+                hook.rule = 'less'
+                hook.compare_func = hook.rule_map[hook.rule]
+                hook.key_indicator = hook.save_best
+            elif hook.save_best == 'motion_min_ade':
+                hook.rule = 'less'
+                hook.compare_func = hook.rule_map[hook.rule]
+                hook.key_indicator = hook.save_best
+            else:
+                hook._init_rule(hook.rule, hook.save_best)
+
+
+def _resolve_auto_early_stopping(hook, runner):
+    """Resolve 'auto' metric/rule based on model's training_stage."""
+    # Stage mapping: stage -> (metric, rule)
+    stage_metric_map = {
+        1: ('motion_min_ade', 'less'),       # Motion: lower ADE is better
+        2: ('composite_iou_pq', 'greater'),  # OCC: 0.5*IoU + 0.5*PQ, higher is better
+        3: ('plan_l2_avg', 'less'),          # Planning: avg L2 of first 2s, lower is better
+    }
+
+    # Try to get training_stage from model config or coupled_lora instance
+    training_stage = 1  # default
+    try:
+        model = runner.model
+        if hasattr(model, 'module'):
+            model = model.module
+        
+        # 1. Try to get stage from model's coupled_lora instance
+        coupled_lora = getattr(model, 'coupled_lora', None)
+        if coupled_lora is not None:
+            training_stage = coupled_lora.get_current_stage()
+        else:
+            # 2. Try to get from model's coupled_lora_cfg attribute
+            coupled_lora_cfg = getattr(model, 'coupled_lora_cfg', None)
+            if coupled_lora_cfg is not None:
+                training_stage = coupled_lora_cfg.get('training_stage', 1)
+            else:
+                # 3. Try from runner.cfg
+                cfg = getattr(runner, 'cfg', None)
+                if cfg is not None:
+                    model_cfg = cfg.get('model', {})
+                    coupled_lora_cfg = model_cfg.get('coupled_lora_cfg', {})
+                    training_stage = coupled_lora_cfg.get('training_stage', 1)
+    except Exception:
+        pass
+
+    metric, rule = stage_metric_map.get(training_stage, ('motion_min_ade', 'less'))
+
+    hook.save_best = metric
+    hook.rule = rule
+    hook.compare_func = hook.rule_map[rule]
+    hook.key_indicator = metric
+    hook._early_stop_resolved = True
+
+    runner.logger.info(
+        f'[EarlyStop] Auto-resolved for stage {training_stage}: '
+        f'metric={metric}, rule={rule}')
+
 
 
 def check_early_stopping(hook, runner, key_score):
+    # Lazy resolve 'auto' metric/rule on first call
+    if not getattr(hook, '_early_stop_resolved', True):
+        _resolve_auto_early_stopping(hook, runner)
+
     if hook.early_stopping is None or key_score is None:
         return False
     current_iter = runner.iter
@@ -122,6 +193,10 @@ def check_early_stopping(hook, runner, key_score):
 
 
 def evaluate_with_composite(hook, runner, results):
+    # Lazy resolve 'auto' early stopping before evaluating
+    if not getattr(hook, '_early_stop_resolved', True):
+        _resolve_auto_early_stopping(hook, runner)
+
     eval_res = hook.dataloader.dataset.evaluate(
         results, logger=runner.logger, runner=runner, **hook.eval_kwargs)
 
@@ -138,7 +213,7 @@ def evaluate_with_composite(hook, runner, results):
             return composite_score
 
         if hook.key_indicator == 'plan_l2_avg':
-            l2_keys = [f'planning/L2_{i*0.5:.1f}s' for i in range(1, 7)]
+            l2_keys = [f'planning/L2_{i*0.5:.1f}s' for i in range(1, 5)]
             l2_values = [eval_res.get(k, 0.0) for k in l2_keys if k in eval_res]
             if l2_values:
                 avg_l2 = sum(l2_values) / len(l2_values)
@@ -147,6 +222,15 @@ def evaluate_with_composite(hook, runner, results):
             else:
                 runner.logger.warning('[EarlyStopping] plan_l2_avg requested but no planning L2 metrics found!')
                 return 0.0
+
+        if hook.key_indicator == 'motion_min_ade':
+            min_ade = eval_res.get('motion/min_ade', None)
+            if min_ade is not None:
+                runner.log_buffer.output['motion_min_ade'] = min_ade
+                return min_ade
+            else:
+                runner.logger.warning('[EarlyStopping] motion_min_ade requested but no motion metrics found!')
+                return None
 
         if not eval_res:
             import warnings

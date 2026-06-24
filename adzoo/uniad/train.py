@@ -22,6 +22,48 @@ from adzoo.uniad.test_utils import custom_multi_gpu_test
 
 warnings.filterwarnings("ignore")
 
+def load_checkpoint_with_lora_mapping(runner, filename, strict=False, logger=None):
+    """自定义 checkpoint 加载，自动将预训练权重映射到被 LoRA 包装过的 Linear 层中"""
+    import torch
+    
+    if logger:
+        logger.info(f"[LoRA Checkpoint Map] Pre-processing checkpoint {filename} to map weights...")
+        
+    checkpoint = torch.load(filename, map_location='cpu')
+    if 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        state_dict = checkpoint
+
+    model_keys = runner.model.state_dict().keys()
+    new_state_dict = {}
+    mapped_count = 0
+    
+    for k_model in model_keys:
+        # 剥离可能存在的 module. 前缀，以便与不带 module. 的原始 checkpoint 匹配
+        k_lookup = k_model[7:] if k_model.startswith('module.') else k_model
+        
+        if k_lookup in state_dict:
+            new_state_dict[k_model] = state_dict[k_lookup]
+        else:
+            # 检测 .linear.weight / .linear.bias 并尝试匹配原始名称
+            k_orig = None
+            if '.linear.weight' in k_lookup:
+                k_orig = k_lookup.replace('.linear.weight', '.weight')
+            elif '.linear.bias' in k_lookup:
+                k_orig = k_lookup.replace('.linear.bias', '.bias')
+            
+            if k_orig and k_orig in state_dict:
+                new_state_dict[k_model] = state_dict[k_orig]
+                mapped_count += 1
+                
+    if logger:
+        logger.info(f"[LoRA Checkpoint Map] Successfully mapped {mapped_count} parameters from original structure to LoRA structure.")
+
+    # 直接将映射后的状态字典载入模型
+    runner.model.load_state_dict(new_state_dict, strict=strict)
+    return checkpoint
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')
@@ -62,8 +104,8 @@ def parse_args():
     parser.add_argument(
         '--training-stage',
         type=int,
-        choices=[1, 2],
-        help='override coupled_lora_cfg.training_stage (1/2)')
+        choices=[1, 2, 3],
+        help='override coupled_lora_cfg.training_stage (1=Motion/2=OCC/3=Planning+Motion)')
     parser.add_argument(
         '--lr',
         type=float,
@@ -113,11 +155,17 @@ def main():
     if args.lr is not None:
         cfg.optimizer['lr'] = args.lr
 
-    # 根据 training_stage 划分 work_dir 子文件夹 (stage1/stage2)
+    # 根据 training_stage 划分 work_dir 子文件夹 (stage1/stage2/stage3)
     if 'coupled_lora_cfg' in cfg.model:
         training_stage = cfg.model['coupled_lora_cfg'].get('training_stage', None)
-        if training_stage in [1, 2]:
-            cfg.work_dir = osp.join(cfg.work_dir, f'stage{training_stage}')
+        if training_stage in [1, 2, 3]:
+            suffix = f'stage{training_stage}'
+            # 智能检测并剥离原 work_dir 末尾已存在的旧 stage 文件夹
+            path_parts = cfg.work_dir.rstrip('/').split('/')
+            if path_parts[-1] in ['stage1', 'stage2', 'stage3']:
+                cfg.work_dir = '/'.join(path_parts[:-1])
+            if not (cfg.work_dir.rstrip('/').endswith(suffix)):
+                cfg.work_dir = osp.join(cfg.work_dir, suffix)
 
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':
@@ -187,6 +235,17 @@ def main():
     model.init_weights()
     model.CLASSES = datasets[0].CLASSES  # add an attribute for visualization convenience
     logger.info(f'Model:\n{model}')
+
+    # 在封装 DDP/DataParallel 之前，如果是 LoRA 模式，先进行非优化参数的 requires_grad = False 冻结
+    # 这样 DDP 可以正确初始化桶 (buckets)，并且完全避免对不需要优化的参数计算未 unscale 的“幽灵”梯度
+    if hasattr(model, 'coupled_lora') and model.coupled_lora is not None:
+        # 显式激活对应阶段的 requires_grad 配置
+        model.coupled_lora.set_training_stage(model.coupled_lora.get_current_stage())
+        trainable_lora_params = set([p for p in model.coupled_lora.get_lora_params() if p.requires_grad])
+        for p in model.parameters():
+            if p not in trainable_lora_params:
+                p.requires_grad = False
+
     if distributed:
         find_unused_parameters = cfg.get('find_unused_parameters', False)
         model = DistributedDataParallel(model.cuda(),
@@ -208,7 +267,7 @@ def main():
         from mmcv.optims.optimizer import OPTIMIZERS
         optimizer_cfg = copy.deepcopy(cfg.optimizer)
         optimizer_cfg.pop('paramwise_cfg', None)
-        optimizer_cfg['params'] = inner.coupled_lora.get_lora_params()
+        optimizer_cfg['params'] = [p for p in inner.coupled_lora.get_lora_params() if p.requires_grad]
         optimizer = build_from_cfg(optimizer_cfg, OPTIMIZERS)
         logger.info(f'[LoRA] Optimizer built with {sum(p.numel() for p in optimizer_cfg["params"]):,} params')
     else:
@@ -253,15 +312,20 @@ def main():
         lora_stage = cfg.model.get('coupled_lora_cfg', {}).get('training_stage', None)
         eval_cfg['lora_stage'] = lora_stage
 
-        # 根据微调阶段（Stage 1 或 Stage 2）动态调整验证的最佳指标和早停规则
+        # 根据微调阶段动态调整验证的最佳指标和早停规则
+        # Stage 1 = Motion, Stage 2 = OCC, Stage 3 = Planning
         if lora_stage == 1:
+            eval_cfg['save_best'] = 'motion_min_ade'
+            eval_cfg['rule'] = 'less'
+            logger.info("[LoRA Stage 1] Early stopping monitored metric: motion_min_ade (less is better)")
+        elif lora_stage == 2:
             eval_cfg['save_best'] = 'composite_iou_pq'
             eval_cfg['rule'] = 'greater'
-            logger.info("[LoRA Stage 1] Early stopping monitored metric: composite_iou_pq (greater is better)")
-        elif lora_stage == 2:
+            logger.info("[LoRA Stage 2] Early stopping monitored metric: composite_iou_pq (greater is better)")
+        elif lora_stage == 3:
             eval_cfg['save_best'] = 'plan_l2_avg'
             eval_cfg['rule'] = 'less'
-            logger.info("[LoRA Stage 2] Early stopping monitored metric: plan_l2_avg (less is better)")
+            logger.info("[LoRA Stage 3] Early stopping monitored metric: plan_l2_avg (less is better)")
 
         # 验证结果保存到 work_dir/val/<timestamp>/ 下，使用绝对路径避免 cwd 依赖
         val_timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
@@ -280,7 +344,7 @@ def main():
         except (ValueError, RuntimeError) as e:
             logger.warning(f'Resume failed ({e}), falling back to load_checkpoint '
                            f'(model weights only, optimizer state discarded)')
-            runner.load_checkpoint(cfg.resume_from)
+            load_checkpoint_with_lora_mapping(runner, cfg.resume_from, logger=logger)
         # 跨阶段 resume：旧 ckpt 的 epoch 可能等于 max_epochs，runner 会认为已完成。
         # 重置 _epoch/_iter 确保新阶段训练正常进行。
         if runner._epoch >= runner.max_epochs:
@@ -289,7 +353,7 @@ def main():
             runner._epoch = 0
             runner._iter = 0
     elif cfg.load_from:
-        runner.load_checkpoint(cfg.load_from)
+        load_checkpoint_with_lora_mapping(runner, cfg.load_from, logger=logger)
 
     from mmcv.core.evaluation.eval_hooks import EarlyStoppingException
     try:

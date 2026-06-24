@@ -322,8 +322,14 @@ class MotionHead(BaseMotionHead):
             level_start_index=torch.tensor([0], device=device))
 
         for lvl in range(inter_states.shape[0]):
+            if torch.isnan(inter_states[lvl]).any():
+                print(f"[MotionHead Debug] inter_states[lvl={lvl}] contains NaN!", flush=True)
             outputs_class = self.traj_cls_branches[lvl](inter_states[lvl])
+            if torch.isnan(outputs_class).any():
+                print(f"[MotionHead Debug] outputs_class lvl={lvl} contains NaN!", flush=True)
             tmp = self.traj_reg_branches[lvl](inter_states[lvl])
+            if torch.isnan(tmp).any():
+                print(f"[MotionHead Debug] tmp lvl={lvl} contains NaN!", flush=True)
             tmp = self.unflatten_traj(tmp)
             
             # we use cumsum trick here to get the trajectory 
@@ -332,8 +338,10 @@ class MotionHead(BaseMotionHead):
             outputs_class = self.log_softmax(outputs_class.squeeze(3))
             outputs_traj_scores.append(outputs_class)
 
+            activated_tmp = []
             for bs in range(tmp.shape[0]):
-                tmp[bs] = bivariate_gaussian_activation(tmp[bs])
+                activated_tmp.append(bivariate_gaussian_activation(tmp[bs]))
+            tmp = torch.stack(activated_tmp, dim=0)
             outputs_trajs.append(tmp)
         outputs_traj_scores = torch.stack(outputs_traj_scores)
         outputs_trajs = torch.stack(outputs_trajs)

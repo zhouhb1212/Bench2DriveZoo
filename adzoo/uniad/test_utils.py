@@ -10,6 +10,7 @@ import torch.distributed as dist
 
 from mmcv.models.dense_heads.occ_head_plugin import IntersectionOverUnion, PanopticMetric
 from mmcv.models.dense_heads.planning_head_plugin import UniADPlanningMetric
+from mmcv.models.dense_heads.planning_head_plugin.motion_metrics import AgentMotionMetric
 from mmcv.utils import ProgressBar, mkdir_or_exist, get_dist_info
 from mmcv.fileio.io import load, dump
 import numpy as np
@@ -82,6 +83,11 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     eval_planning =  hasattr(inner, 'with_planning_head') and inner.with_planning_head
     if eval_planning:
         planning_metrics = UniADPlanningMetric().cuda()
+
+    # Motion eval init: evaluate agent trajectory prediction quality
+    eval_motion = hasattr(inner, 'with_motion_head') and inner.with_motion_head
+    if eval_motion:
+        motion_metrics = AgentMotionMetric(n_future=12, miss_threshold=2.0).cuda()
         
     bbox_results = []
     mask_results = []
@@ -111,10 +117,76 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
 
                 planning_metrics(pred_sdc_traj[:, :6, :2], sdc_planning[:, 0, :6, :2], sdc_planning_mask[:, 0, :6, :2], segmentation[:, 1:7])
 
+            # EVAL motion: agent trajectory prediction (min_ADE/FDE/MR)
+            if eval_motion:
+                # pred traj: (num_agents, num_modes, T, 2), SDC is last
+                # gt_fut_traj from data dict: (num_gt_agents, T_gt, 2)
+                if 'traj' in result[0]:
+                    pred_traj = result[0]['traj']  # (num_agents, num_modes, T, 2)
+                    # Exclude SDC (last agent) from motion evaluation
+                    if pred_traj.shape[0] > 1:
+                        pred_traj_agents = pred_traj[:-1]  # (N_pred, num_modes, T, 2)
+                    else:
+                        pred_traj_agents = pred_traj[:0]  # empty, no other agents
+
+                    # Get GT trajectories from data dict
+                    gt_fut_traj = data.get('gt_fut_traj', None)
+                    gt_fut_traj_mask = data.get('gt_fut_traj_mask', None)
+
+                    def safe_unwrap_dc(dc):
+                        if dc is None:
+                            return None
+                        for _ in range(3):
+                            if hasattr(dc, 'data'):
+                                dc = dc.data
+                            if isinstance(dc, list) and len(dc) > 0:
+                                dc = dc[0]
+                        return dc
+
+                    gt_fut_traj = safe_unwrap_dc(gt_fut_traj)
+                    gt_fut_traj_mask = safe_unwrap_dc(gt_fut_traj_mask)
+
+                    if gt_fut_traj is not None and gt_fut_traj_mask is not None:
+                        # Convert numpy to tensor if needed
+                        import numpy as np
+                        if isinstance(gt_fut_traj, np.ndarray):
+                            gt_fut_traj = torch.from_numpy(gt_fut_traj).float()
+                        if isinstance(gt_fut_traj_mask, np.ndarray):
+                            gt_fut_traj_mask = torch.from_numpy(gt_fut_traj_mask).float()
+                        if isinstance(gt_fut_traj, torch.Tensor) and gt_fut_traj.numel() > 0:
+                            # Squeeze batch dimension if present
+                            # Expected final: gt_fut_traj (N_gt, T, 2), gt_fut_traj_mask (N_gt, T, 2)
+                            if gt_fut_traj.dim() == 4:
+                                gt_fut_traj = gt_fut_traj.squeeze(0)  # (N_gt, T, 2)
+                            if gt_fut_traj_mask.dim() == 4:
+                                gt_fut_traj_mask = gt_fut_traj_mask.squeeze(0)  # (N_gt, T, 2)
+
+                            # Convert mask to per-timestep: valid if both x,y valid
+                            gt_mask = gt_fut_traj_mask[..., 0] * gt_fut_traj_mask[..., 1]  # (N_gt, T)
+
+                            # pred_traj_agents: (N_pred, modes, T, feat)
+                            # gt_fut_traj: (N_gt, T, 2)
+                            # Match by taking min(N_pred, N_gt) agents
+                            N_pred = pred_traj_agents.shape[0]
+                            N_gt = gt_fut_traj.shape[0]
+                            N = min(N_pred, N_gt)
+                            if N > 0:
+                                pred_input = pred_traj_agents[:N]  # (N, modes, T, feat)
+                                gt_input = gt_fut_traj[:N, :, :2]  # (N, T, 2)
+                                mask_input = gt_mask[:N]  # (N, T)
+                                # Only take xy coords from pred
+                                if pred_input.shape[-1] > 2:
+                                    pred_input = pred_input[..., :2]  # (N, modes, T, 2)
+                                motion_metrics.update(
+                                    pred_input.cuda(),
+                                    gt_input.cuda(),
+                                    mask_input.cuda()
+                                )
+
             # # Eval Occ
             if eval_occ:
-                occ_has_invalid_frame = data['gt_occ_has_invalid_frame'][0]
-                occ_to_eval = not occ_has_invalid_frame.item()
+                occ_has_invalid_frame = safe_unwrap_dc(data.get('gt_occ_has_invalid_frame', None))
+                occ_to_eval = occ_has_invalid_frame is not None and not occ_has_invalid_frame.item()
                 if occ_to_eval and 'occ' in result[0].keys():
                     num_occ += 1
                     for key, grid in EVALUATION_RANGES.items():
@@ -196,6 +268,10 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
         planning_results = planning_metrics.compute()
         planning_metrics.reset()
 
+    if eval_motion:
+        motion_results = motion_metrics.compute()
+        motion_metrics.reset()
+
     ret_results = dict()
     ret_results['bbox_results'] = bbox_results
     if eval_occ:
@@ -215,6 +291,8 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
         ret_results['occ_results_computed'] = occ_results
     if eval_planning:
         ret_results['planning_results_computed'] = planning_results
+    if eval_motion:
+        ret_results['motion_results_computed'] = motion_results
 
     if mask_results is not None:
         ret_results['mask_results'] = mask_results

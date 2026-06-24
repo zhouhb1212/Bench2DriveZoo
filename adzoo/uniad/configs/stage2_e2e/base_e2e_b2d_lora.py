@@ -1,21 +1,55 @@
 # ---------------------------------------------------------------------------------#
-# Occupancy-Planning Coupled LoRA 配置文件
+# Motion-Occupancy-Planning Coupled LoRA 配置文件
 #
-# 基于 base_e2e_b2d.py，增加 LoRA 微调相关配置。
+# 基于 base_e2e_b2d.py，增加三阶段 LoRA 微调相关配置。
 #
-# 两阶段训练（必须按顺序执行）：
-#   Stage 1 (training_stage=1): 仅 OccHead LoRA，lr=3e-4，epochs=2
-#   Stage 2 (training_stage=2): 仅 PlanningHead LoRA，lr=3e-4，resume Stage1 ckpt
+# 三阶段训练（必须按顺序执行）：
+#   Stage 1 (training_stage=1): 仅 Motion LoRA（优化 sdc_traj_query 表征）
+#   Stage 2 (training_stage=2): 仅 OccHead LoRA（优化占用预测）
+#   Stage 3 (training_stage=3): Planning + Motion LoRA 联合优化
+#                                (planning loss 回传到 motionformer LoRA)
 #
 # 用法：通过命令行 --training-stage 和 --lr 覆盖
 # ---------------------------------------------------------------------------------#
 
 _base_ = ["./base_e2e_b2d.py"]
 
-# 预训练权重（包含 Stage1 Track+Map + Stage2 E2E 完整权重）
-load_from = "ckpts/uniad_base_b2d.pth"
+# 预训练权重
+load_from = "/data/Bench2DriveZoo/adzoo/uniad/new_work_dirs/stage1/ablation/0.4r=16/iter_3000.pth"
 
-# ── Occupancy-Planning Coupled LoRA 配置 ──
+# ── 目标场景定义 ──
+target_scenarios = ["ParkedObstacleTwoWays"]
+
+
+if "ParkedObstacleTwoWays" in target_scenarios:
+    # 针对双向避障场景的特化优化：
+    # 1. 采用 RelativeCollisionLoss 避免训练中自车因安全框膨胀与真实绕行轨迹冲突；
+    # 2. 收紧 delta 碰撞检测半径（0.0/0.25/0.5），降低避障时惩罚过重导致的“不敢绕行”或“过度转向”；
+    # 3. 引入 PlanningDirectionLoss (方向/航向角损失) 直接监督轨迹的切线方向，提升绕行与回正控制精度。
+    planning_head_cfg = dict(
+        loss_collision=[
+            dict(type='RelativeCollisionLoss', delta=0.0, weight=0.1),
+            dict(type='RelativeCollisionLoss', delta=0.25, weight=0.04),
+            dict(type='RelativeCollisionLoss', delta=0.5, weight=0.01)
+        ],
+        loss_direction=dict(type='PlanningDirectionLoss', weight=0.5),
+        col_optim_args=dict(
+            occ_filter_range=5.0,  
+            sigma=1.0,
+            alpha_collision=8.0,      # 增强避障排斥力度
+        )
+    )
+else:
+    # 默认通用微调配置（轻度避撞约束，保持平稳）
+    planning_head_cfg = dict(
+        loss_collision=[
+            dict(type='CollisionLoss', delta=0.0, weight=0.1),
+            dict(type='CollisionLoss', delta=0.5, weight=0.04),
+            dict(type='CollisionLoss', delta=1.0, weight=0.01)
+        ]
+    )
+
+# ── Motion-Occupancy-Planning Coupled LoRA 配置 ──
 model = dict(
     # 关闭 OccHead aux loss 计算：aux 输出在 Transformer Decoder 之前，
     # LoRA 注入在 Decoder 内部，aux loss 无法获得有效梯度，仅为无用计算
@@ -27,11 +61,12 @@ model = dict(
         alpha=16,        # scale = alpha/r = 1（全局默认值；per-head 配置优先）
         dropout=0.05,
         # Per-head LoRA 参数覆写（可选，不指定时回退到全局默认值）
-        occ_lora=dict(r=16, alpha=32),       # Stage 1 OccHead: scale=alpha/r=2
-        planning_lora=dict(r=8, alpha=8),    # Stage 2 PlanningHead 微调容量
+        motion_lora=dict(r=16, alpha=32),      # Stage 1 Motion: scale=2
+        occ_lora=dict(r=16, alpha=32),         # Stage 2 OccHead: scale=2
+        planning_lora=dict(r=16, alpha=32),    # Stage 3 PlanningHead: scale=2
         inject_q2o_feat=True,  # 向 query_to_occ_feat 注入 LoRA；False 用于消融/旧权重兼容
         pretrained_path="ckpts/uniad_base_b2d.pth",
-        training_stage=1,  # 切换阶段：1 / 2
+        training_stage=2,  # 切换阶段：1=Motion / 2=OCC / 3=Planning+Motion联合
     ),
     task_loss_weight=dict(
         track=1.0,
@@ -40,21 +75,18 @@ model = dict(
         occ=1.0,
         planning=2.0,
     ),
-    planning_head=dict(
-        loss_collision=[
-            dict(type='CollisionLoss', delta=0.0, weight=0.1),   # 稀释碰撞权重以防止强力偏离专家轨迹 (方案2)
-            dict(type='CollisionLoss', delta=0.5, weight=0.04),
-            dict(type='CollisionLoss', delta=1.0, weight=0.01)
-        ]
-    ),
+    planning_head=planning_head_cfg,
 )
 
 # ── 优化器（仅 LoRA 参数 requires_grad=True，其余已冻结）──
 optimizer = dict(
     type="AdamW",
-    lr=3e-5,      # 降低 LR 至 3e-5 以防止大梯度冲击和发散，使微调更平稳
+    lr=2e-4,      # LoRA 标准 lr（原 5e-6 过低，90% 步被 GradScaler 跳过）
     weight_decay=0.01,  # LoRA 参数少，0.01 避免衰减过强拉向零
 )
+
+# ── 输出路径 ──
+work_dir = "/data/Bench2DriveZoo/adzoo/uniad/new_work_dirs/stage1"
 
 # DDP 关闭 unused 参数检测，避免 allreduce 时梯度缓冲区未填充 of 错误
 find_unused_parameters = False
@@ -70,9 +102,9 @@ data = dict(
     train=dict(
         oversample_cfg=dict(
             enable=True,                            # True 时启用
-            scenarios=["ParkedObstacleTwoWays"],     # 要过采样的场景
-            ratio=1,                                 # 额外复制轮数（总出现 = 1+ratio 次）
-            max_other_frames=85561,             # 其他场景总帧数上限
+            scenarios=target_scenarios,              # 要过采样的场景
+            ratio=0,                                 # 额外复制
+            max_other_frames=42780,               # 其他场景限制帧数
             seed=42,
         ),
     ),
@@ -90,20 +122,19 @@ runner = dict(type="EpochBasedRunner", max_epochs=2)
 # ── Checkpoint 和验证频率 ──
 # 总 iter 约 6600（1 epoch），checkpoint 每 1000 iter 保存一次
 checkpoint_config = dict(
-    interval=1000,
+    interval=500,
     by_epoch=False,
-    # 文件命名：iter_1000.pth, iter_2000.pth, ...
-    # epoch 结束时额外保存 epoch_1.pth
 )
-# 验证每 1000 iter 执行一次，支持自动早停保护
-# 注：save_best 与 rule 已由 train.py 依据训练阶段（Stage 1 或 2）动态自适应注入
+# 验证每 500 iter 执行一次，更频繁地检测过拟合
 evaluation = dict(
-    interval=1000,
+    interval=500,
     by_epoch=False,
     early_stopping=dict(
-        patience=3,
-        min_delta=0.0,
-        warmup_iters=3000,
+        metric='auto',            # 自动匹配训练阶段: stage1→motion_min_ade, stage2→occ_iou, stage3→planning_L2
+        rule='auto',              # 自动匹配: motion/planning→less, occ→greater
+        patience=5,               # 连续 5 次验证不改善则停止（=2500 iter）
+        min_delta=0.001,          # 改善需超过阈值才算有效
+        warmup_iters=500,         # 前 500 iter 不触发早停（warmup 阶段）
     )
 )
 log_config = dict(
@@ -115,22 +146,22 @@ log_config = dict(
 )
 
 # ── AMP 混合精度 + 梯度累积 ──
-# 累积 2 步：增大更新频率让优化器能及时纠正振荡方向，
-# 避免连续多步高梯度累加后单次大更新冲过头
+# 累积 2 步：平滑 motion.l_reg 的极端 spike，降低单次更新方差
+# 使用较温和的初始 loss_scale (512.0) 避免 PyTorch GradScaler 默认 65536.0 导致前几步频繁 overflow
 optimizer_config = dict(
     type='GradientCumulativeFp16OptimizerHook',
-    cumulative_iters=2,  # 累积 2 步：每个 GPU 的 samples_per_gpu 为 1，累积 2 步达到有效 batch_size=2
-    grad_clip=dict(max_norm=0.5, norm_type=2),  # 收紧梯度裁剪至 0.5，防范碰撞梯度冲击
+    cumulative_iters=2,  # 有效 batch_size=2
+    grad_clip=dict(max_norm=5.0, norm_type=2),  
+    loss_scale=dict(init_scale=512.0),
 )
 
 # ── 学习率调度（全局 cosine，跨 epoch 连续）──
 # by_epoch=False: 整个训练周期为一次 cosine 衰减，消除 epoch 边界 lr 跳变
-# 仅训练开始执行一次 warmup（前 200 iter）
 lr_config = dict(
     by_epoch=False,               # 全局连续调度，不每 epoch 重置
     policy="CosineAnnealing",
     warmup="linear",
-    warmup_iters=500,             # 训练开始前 500 iter warmup
-    warmup_ratio=0.1,             # 从 0.1*peak 起步
-    min_lr_ratio=5e-2,            # 最终 lr 衰减到 peak 的 5%，防止后期 delta 过小
+    warmup_iters=200,             # 拉长 warmup 让 GradScaler 稳定（原 100 太短）
+    warmup_ratio=0.01,            # 从 0.01*peak=2e-6 起步，避免初始大梯度触发 overflow
+    min_lr_ratio=0.01,            # 最终 lr 衰减到 peak 的 1%（=2e-6）
 )

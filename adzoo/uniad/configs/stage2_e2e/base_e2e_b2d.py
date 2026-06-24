@@ -702,6 +702,9 @@ test_pipeline = [
                                             "sdc_planning",	
                                             "sdc_planning_mask",	
                                             "command",
+                                            # motion evaluation
+                                            "gt_fut_traj",
+                                            "gt_fut_traj_mask",
                                         ]
             ),
         ],

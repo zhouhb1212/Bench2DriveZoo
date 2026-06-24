@@ -904,27 +904,46 @@ class B2D_E2E_Dataset(Custom3DDataset):
             detail['occ/num_frames'] = occ_results_computed.get('num_occ', 0)
             detail['occ/ratio'] = occ_results_computed.get('ratio_occ', 0)
 
+        if 'motion_results_computed' in results.keys():
+            motion_results_computed = results['motion_results_computed']
+            motion_tab = PrettyTable()
+            motion_tab.field_names = ["Motion Metric", "Value"]
+            motion_tab.add_row(["min_ADE (m)", '%.4f' % motion_results_computed.get('min_ade', 0.0)])
+            motion_tab.add_row(["min_FDE (m)", '%.4f' % motion_results_computed.get('min_fde', 0.0)])
+            motion_tab.add_row(["Miss Rate", '%.4f' % motion_results_computed.get('miss_rate', 0.0)])
+            motion_tab.add_row(["Num Agents", '%d' % motion_results_computed.get('num_agents', 0)])
+            print(motion_tab)
+
+            # Write motion metrics into detail dict for logging
+            for key, value in motion_results_computed.items():
+                detail[f'motion/{key}'] = float(value)
+
         # Stage-Aware Highlight Report
         if lora_stage is not None:
             print("\n" + "=" * 60)
             print(f"            LoRA Stage-Aware Evaluation Report (Stage {lora_stage})            ")
             print("=" * 60)
             if lora_stage == 1:
+                print(">>> TARGET FOCUS: MOTION PERFORMANCE (突出Motion指标) <<<")
+                if 'motion_results_computed' in results.keys():
+                    mot_res = results['motion_results_computed']
+                    print(f"  [min_ADE]:    {mot_res.get('min_ade', 0.0):.4f} m")
+                    print(f"  [min_FDE]:    {mot_res.get('min_fde', 0.0):.4f} m")
+                    print(f"  [Miss Rate]:  {mot_res.get('miss_rate', 0.0):.4f}")
+                    print(f"  [Num Agents]: {mot_res.get('num_agents', 0)}")
+                else:
+                    print("  [Warning] Motion results not found in evaluation outputs!")
+            elif lora_stage == 2:
                 print(">>> TARGET FOCUS: OCCUPANCY PERFORMANCE (突出OCC指标) <<<")
                 if 'occ_results_computed' in results.keys():
                     occ_res = results['occ_results_computed']
                     iou_scores = occ_res.get('iou', [0, 0])
                     pq_scores = occ_res.get('pq', [0, 0])
-                    sq_scores = occ_res.get('sq', [0, 0])
-                    rq_scores = occ_res.get('rq', [0, 0])
-                    
                     print(f"  [Occ IoU]   30x30m: {iou_scores[0]:.2f}% | 100x100m: {iou_scores[1]:.2f}%")
                     print(f"  [Occ PQ]    30x30m: {pq_scores[0]:.2f}%  | 100x100m: {pq_scores[1]:.2f}%")
-                    print(f"  [Occ SQ]    30x30m: {sq_scores[0]:.2f}%  | 100x100m: {sq_scores[1]:.2f}%")
-                    print(f"  [Occ RQ]    30x30m: {rq_scores[0]:.2f}%  | 100x100m: {rq_scores[1]:.2f}%")
                 else:
                     print("  [Warning] Occupancy results not found in evaluation outputs!")
-            elif lora_stage == 2:
+            elif lora_stage == 3:
                 print(">>> TARGET FOCUS: PLANNING PERFORMANCE (突出PLAN指标) <<<")
                 if 'planning_results_computed' in results.keys():
                     plan_res = results['planning_results_computed']
@@ -947,12 +966,47 @@ class B2D_E2E_Dataset(Custom3DDataset):
             os.makedirs(val_dir, exist_ok=True)
             txt_path = os.path.join(val_dir, f'iter_{cur_iter}.txt')
             with open(txt_path, 'w', encoding='utf-8') as f:
+                if 'motion_results_computed' in results.keys() and 'motion_tab' in locals():
+                    f.write("Motion Evaluation Results:\n")
+                    f.write(str(motion_tab) + "\n\n")
                 if 'occ_results_computed' in results.keys() and 'occ_tab' in locals():
                     f.write("Occupancy Evaluation Results:\n")
                     f.write(str(occ_tab) + "\n\n")
                 if 'planning_results_computed' in results.keys() and 'planning_tab' in locals():
                     f.write("Planning Evaluation Results:\n")
                     f.write(str(planning_tab) + "\n")
+        else:
+            # Standalone eval: save to new_work_dirs/stage{N}/eval_<timestamp>.txt
+            import time as _time
+            stage_num = lora_stage if lora_stage is not None else 1
+            standalone_dir = f'/data/Bench2DriveZoo/adzoo/uniad/new_work_dirs/stage{stage_num}'
+            os.makedirs(standalone_dir, exist_ok=True)
+            timestamp_str = _time.strftime('%Y%m%d_%H%M%S')
+            txt_path = os.path.join(standalone_dir, f'eval_{timestamp_str}.txt')
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write(f"LoRA Stage {stage_num} Evaluation Results\n")
+                f.write(f"Timestamp: {timestamp_str}\n")
+                f.write("=" * 60 + "\n\n")
+                if 'motion_results_computed' in results.keys() and 'motion_tab' in locals():
+                    f.write("Motion Evaluation Results:\n")
+                    f.write(str(motion_tab) + "\n\n")
+                if 'occ_results_computed' in results.keys() and 'occ_tab' in locals():
+                    f.write("Occupancy Evaluation Results:\n")
+                    f.write(str(occ_tab) + "\n")
+                    f.write(f"Occ eval frames: {occ_results_computed.get('num_occ', 'N/A')}, "
+                            f"ratio: {occ_results_computed.get('ratio_occ', 0):.2%}\n\n")
+                if 'planning_results_computed' in results.keys() and 'planning_tab' in locals():
+                    f.write("Planning Evaluation Results:\n")
+                    f.write(str(planning_tab) + "\n\n")
+                # Detection summary
+                f.write(f"Detection:\n")
+                f.write(f"  NDS: {metrics_summary['nd_score']:.4f}\n")
+                f.write(f"  mAP: {metrics_summary['mean_ap']:.4f}\n\n")
+                # Full detail dict
+                f.write("Full Metrics Dict:\n")
+                for k, v in detail.items():
+                    f.write(f"  {k}: {v}\n")
+            print(f"\n[INFO] Evaluation results saved to: {txt_path}")
 
         return detail
 

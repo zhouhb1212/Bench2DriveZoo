@@ -93,9 +93,9 @@ class UniAD(UniADTrack):
         assert set(task_loss_weight.keys()) == \
                {'track', 'occ', 'motion', 'map', 'planning'}
 
-        # Occupancy-Planning Coupled LoRA (两阶段训练管理器)
+        # Occupancy-Planning-Motion Coupled LoRA (三阶段训练管理器)
         if coupled_lora_cfg is not None and occ_head is not None and planning_head is not None:
-            # 预加载 occ_head / planning_head 预训练权重到子模块
+            # 预加载 occ_head / planning_head / motion_head 预训练权重到子模块
             # 必须在 LoRA 注入之前完成，确保 inject_lora_to_linear 的 copy_() 复制的是预训练值
             pretrained_path = coupled_lora_cfg.get('pretrained_path', None)
             if pretrained_path and os.path.exists(pretrained_path):
@@ -105,14 +105,20 @@ class UniAD(UniADTrack):
                              if k.startswith('occ_head.')}
                 plan_state = {k[len('planning_head.'):]: v for k, v in state_dict.items()
                               if k.startswith('planning_head.')}
+                motion_state = {k[len('motion_head.'):]: v for k, v in state_dict.items()
+                                if k.startswith('motion_head.')}
                 if occ_state:
                     self.occ_head.load_state_dict(occ_state, strict=False)
                 if plan_state:
                     self.planning_head.load_state_dict(plan_state, strict=False)
+                if motion_state and hasattr(self, 'motion_head'):
+                    self.motion_head.load_state_dict(motion_state, strict=False)
 
             from ..dense_heads.planning_head_plugin.occ_plan_coupled_lora import OccPlanCoupledLoRA
+            motion_head_ref = self.motion_head if hasattr(self, 'motion_head') else None
             self.coupled_lora = OccPlanCoupledLoRA(
-                self.occ_head, self.planning_head, coupled_lora_cfg)
+                self.occ_head, self.planning_head, coupled_lora_cfg,
+                motion_head=motion_head_ref)
             self.coupled_lora.inject()
 
             # 冻结所有非 LoRA 参数（backbone/BEVFormer/其他 head），
@@ -280,13 +286,23 @@ class UniAD(UniADTrack):
         stage2_only = (self.coupled_lora is not None
                        and self.coupled_lora.get_current_stage() == 2)
 
-        # 冻结 head（track/map/motion）用 no_grad 执行，节省显存和算力
-        # 所有 LoRA stage 均冻结这些 head；仅无 LoRA 时正常执行
-        frozen_heads_ctx = (
+        # 冻结 head（track/map）用 no_grad 执行，节省显存和算力
+        # 所有 LoRA stage 均冻结这些基础 head；仅无 LoRA 时正常执行
+        frozen_base_ctx = (
             torch.no_grad() if self.coupled_lora is not None
             else contextlib.nullcontext())
 
-        with frozen_heads_ctx:
+        # Motion head 的梯度控制：
+        # Stage 1: Motion LoRA 需要梯度（用 motion loss 训练）
+        # Stage 2: 冻结 motion head（只训练 OCC LoRA）
+        # Stage 3: Motion LoRA 需要梯度（planning loss 回传）
+        current_stage = self.coupled_lora.get_current_stage() if self.coupled_lora else 0
+        motion_needs_grad = current_stage in (1, 3)
+        frozen_motion_ctx = (
+            contextlib.nullcontext() if motion_needs_grad or self.coupled_lora is None
+            else torch.no_grad())
+
+        with frozen_base_ctx:
             losses_track, outs_track = self.forward_track_train(
                 img, gt_bboxes_3d, gt_labels_3d, gt_past_traj,
                 gt_past_traj_mask, gt_inds, gt_sdc_bbox, gt_sdc_label,
@@ -304,7 +320,7 @@ class UniAD(UniADTrack):
 
         outs_seg = dict()
         if self.with_seg_head:
-            with frozen_heads_ctx:
+            with frozen_base_ctx:
                 losses_seg, outs_seg = self.seg_head.forward_train(
                     bev_embed, img_metas,
                     gt_lane_labels, gt_lane_bboxes, gt_lane_masks)
@@ -314,7 +330,7 @@ class UniAD(UniADTrack):
         outs_motion = dict()
         # Forward Motion Head
         if self.with_motion_head:
-            with frozen_heads_ctx:
+            with frozen_motion_ctx:
                 ret_dict_motion = self.motion_head.forward_train(
                     bev_embed,
                     gt_bboxes_3d, gt_labels_3d,
@@ -325,11 +341,19 @@ class UniAD(UniADTrack):
             outs_motion['bev_pos'] = bev_pos
             losses_motion = ret_dict_motion["losses"]
             losses_motion = self.loss_weighted_and_prefixed(losses_motion, prefix='motion')
-            monitoring_losses.update(losses_motion)
+            # Stage 1: motion loss 参与反向传播（训练 Motion LoRA）
+            # 其他 Stage: motion loss 仅作为监控指标
+            if stage1_only:
+                losses.update(losses_motion)
+            else:
+                monitoring_losses.update(losses_motion)
 
-        # Forward Occ Head（LoRA 可训练：Stage 1；Stage 2 跳过：
-        # PlanningHead.forward_train 硬编码 occ_mask=None，不需要 Occ 特征）
-        if self.with_occ_head and not stage2_only:
+        # Forward Occ Head
+        # Stage 1: 跳过（只训练 motion）
+        # Stage 2: 执行（OCC LoRA 需要梯度）
+        # Stage 3: 跳过（planning 训练不需要 occ loss）
+        skip_occ = stage1_only or (current_stage == 3)
+        if self.with_occ_head and not skip_occ:
             if outs_motion['track_query'].shape[1] == 0:# avoid 0 track
                 outs_motion['track_query'] = torch.zeros((1, 1, 256)).to(bev_embed)
                 outs_motion['track_query_pos'] = torch.zeros((1,1, 256)).to(bev_embed)
@@ -346,8 +370,12 @@ class UniAD(UniADTrack):
             losses_occ = self.loss_weighted_and_prefixed(losses_occ, prefix='occ')
             losses.update(losses_occ)
 
-        # Forward Plan Head（LoRA 可训练：Stage 2；Stage 1 跳过以加速训练）
-        if self.with_planning_head and not stage1_only:
+        # Forward Plan Head
+        # Stage 1: 跳过（只训练 motion）
+        # Stage 2: 跳过（只训练 OCC）
+        # Stage 3: 执行（Planning + Motion LoRA 联合训练）
+        skip_planning = stage1_only or stage2_only
+        if self.with_planning_head and not skip_planning:
             outs_planning = self.planning_head.forward_train(
                 bev_embed, outs_motion, sdc_planning, sdc_planning_mask,
                 command, gt_future_boxes)
@@ -502,10 +530,13 @@ class UniAD(UniADTrack):
         result_track[0] = pop_elem_in_result(result_track[0], pop_track_list)
 
         if self.with_seg_head:
+            if 'pts_bbox' in result_seg[0]:
+                for k, v in result_seg[0]['pts_bbox'].items():
+                    result_seg[0][k] = v
             result_seg[0] = pop_elem_in_result(result_seg[0], pop_list=['pts_bbox', 'args_tuple'])
         if self.with_motion_head:
             result_motion[0] = pop_elem_in_result(result_motion[0])
-        if self.with_occ_head:
+        if self.with_occ_head and os.environ.get('ENABLE_PLOT_MODE', None) is None:
             result[0]['occ'] = pop_elem_in_result(result[0]['occ'],  \
                 pop_list=['seg_out_mask', 'flow_out', 'future_states_occ', 'pred_ins_masks', 'pred_raw_occ', 'pred_ins_logits', 'pred_ins_sigmoid'])
         

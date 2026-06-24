@@ -87,6 +87,16 @@ class LoRALinear(nn.Module):
         for param in self.linear.parameters():
             param.requires_grad = False
 
+    @property
+    def weight(self):
+        """兼容 PyTorch TransformerEncoderLayer 直接访问 .weight"""
+        return self.linear.weight
+
+    @property
+    def bias(self):
+        """兼容 PyTorch TransformerEncoderLayer 直接访问 .bias"""
+        return self.linear.bias
+
     def forward(self, x):
         """前向传播 = 原始输出 + LoRA输出"""
         return self.linear(x) + self.lora_adapter(x)
@@ -188,63 +198,65 @@ class LoRAConfig:
 # LoRA-injected MultiheadAttention
 # ---------------------------------------------------------------------------------#
 
-class LoRAMultiheadAttention(nn.Module):
+class LoRAMultiheadAttention(nn.MultiheadAttention):
     """
     在 nn.MultiheadAttention 的 Q/K/V 投影和输出投影上注入 LoRA。
 
-    通过 F.multi_head_attention_forward 使用 LoRA 增强后的权重，
-    原始 MHA 参数冻结，只训练 LoRA 低秩矩阵。
+    继承 nn.MultiheadAttention，保留所有原始属性和方法（merge_masks, out_proj 等），
+    仅覆盖 forward 来注入 LoRA 增强的投影权重。
 
     注入目标:
         - in_proj_weight  [3*embed_dims, embed_dims]  → Q/K/V 合并投影
         - out_proj.weight [embed_dims, embed_dims]     → 输出投影
 
     Args:
-        mha: 原始 nn.MultiheadAttention 模块（会被冻结）
+        mha: 原始 nn.MultiheadAttention 模块（状态会被复制过来）
         r: LoRA rank
         alpha: LoRA 缩放因子, actual_scale = alpha / r
         dropout: LoRA dropout 概率
     """
 
     def __init__(self, mha, r=8, alpha=16, dropout=0.1):
-        super().__init__()
-        embed_dim = mha.embed_dim
-        num_heads = mha.num_heads
-        self.scaling = alpha / r
+        # 用原始 MHA 的参数初始化父类
+        super().__init__(
+            embed_dim=mha.embed_dim,
+            num_heads=mha.num_heads,
+            dropout=mha.dropout,
+            bias=mha.in_proj_bias is not None,
+            add_bias_kv=mha.bias_k is not None,
+            add_zero_attn=mha.add_zero_attn,
+            kdim=getattr(mha, 'kdim', mha.embed_dim),
+            vdim=getattr(mha, 'vdim', mha.embed_dim),
+            batch_first=getattr(mha, 'batch_first', False),
+        )
 
-        # 保留原始 MHA 结构信息
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.batch_first = getattr(mha, 'batch_first', False)
-        self.kdim = getattr(mha, 'kdim', embed_dim)
-        self.vdim = getattr(mha, 'vdim', embed_dim)
-        self._qkv_same_embed_dim = (self.kdim == embed_dim and self.vdim == embed_dim)
+        # 复制原始 MHA 的权重到本模块
+        self.in_proj_weight.data.copy_(mha.in_proj_weight.data)
+        if mha.in_proj_bias is not None:
+            self.in_proj_bias.data.copy_(mha.in_proj_bias.data)
+        self.out_proj.weight.data.copy_(mha.out_proj.weight.data)
+        if mha.out_proj.bias is not None:
+            self.out_proj.bias.data.copy_(mha.out_proj.bias.data)
+        if mha.bias_k is not None:
+            self.bias_k.data.copy_(mha.bias_k.data)
+        if mha.bias_v is not None:
+            self.bias_v.data.copy_(mha.bias_v.data)
 
-        # 保存原始 MHA 的冻结权重引用
-        self.in_proj_weight = mha.in_proj_weight
-        self.in_proj_bias = mha.in_proj_bias
-        self.out_proj_weight = mha.out_proj.weight
-        self.out_proj_bias = mha.out_proj.bias
-        self.bias_k = mha.bias_k
-        self.bias_v = mha.bias_v
-        self.add_zero_attn = mha.add_zero_attn
-        self.dropout_p = mha.dropout
-
-        # 冻结原始 MHA 全部参数
-        for p in mha.parameters():
+        # 冻结所有原始参数
+        for p in self.parameters():
             p.requires_grad = False
 
+        # LoRA 缩放
+        self.scaling = alpha / r
+
         # ── LoRA for in_proj (Q/K/V combined) ──
-        # lora_A_in: [r, embed_dim], lora_B_in: [3*embed_dim, r]
-        # delta_W = lora_B_in @ lora_A_in → [3*embed_dim, embed_dim]
+        embed_dim = mha.embed_dim
         self.lora_A_in = nn.Parameter(torch.empty(r, embed_dim))
         self.lora_B_in = nn.Parameter(torch.zeros(3 * embed_dim, r))
         nn.init.kaiming_uniform_(self.lora_A_in, a=5**0.5)
         nn.init.zeros_(self.lora_B_in)
 
         # ── LoRA for out_proj ──
-        # lora_A_out: [r, embed_dim], lora_B_out: [embed_dim, r]
-        # delta_W = lora_B_out @ lora_A_out → [embed_dim, embed_dim]
         self.lora_A_out = nn.Parameter(torch.empty(r, embed_dim))
         self.lora_B_out = nn.Parameter(torch.zeros(embed_dim, r))
         nn.init.kaiming_uniform_(self.lora_A_out, a=5**0.5)
@@ -261,8 +273,8 @@ class LoRAMultiheadAttention(nn.Module):
         """将 LoRA 权重合并到原始权重中（用于推理加速）"""
         delta_in = (self.lora_B_in @ self.lora_A_in) * self.scaling
         delta_out = (self.lora_B_out @ self.lora_A_out) * self.scaling
-        self.in_proj_weight.data = self.in_proj_weight.data + delta_in
-        self.out_proj_weight.data = self.out_proj_weight.data + delta_out
+        self.in_proj_weight.data += delta_in
+        self.out_proj.weight.data += delta_out
 
     def forward(self, query, key, value, key_padding_mask=None,
                 need_weights: bool = True, attn_mask=None,
@@ -278,7 +290,7 @@ class LoRAMultiheadAttention(nn.Module):
         delta_out = (self.lora_B_out @ self.lora_A_out) * self.scaling  # [E, E]
 
         aug_in_proj = self.in_proj_weight + delta_in     # differentiable
-        aug_out_proj = self.out_proj_weight + delta_out  # differentiable
+        aug_out_proj = self.out_proj.weight + delta_out  # differentiable
 
         # ── 处理 batch_first ──
         is_batched = query.dim() == 3
@@ -291,14 +303,14 @@ class LoRAMultiheadAttention(nn.Module):
             self.embed_dim, self.num_heads,
             aug_in_proj, self.in_proj_bias,
             self.bias_k, self.bias_v, self.add_zero_attn,
-            self.dropout_p, aug_out_proj, self.out_proj_bias,
+            self.dropout if self.training else 0.0,
+            aug_out_proj, self.out_proj.bias,
             training=self.training,
             key_padding_mask=key_padding_mask,
             need_weights=need_weights,
             attn_mask=attn_mask,
             use_separate_proj_weight=False,
             average_attn_weights=average_attn_weights,
-            **kwargs,
         )
 
         if self.batch_first and is_batched:

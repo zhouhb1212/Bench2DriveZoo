@@ -51,10 +51,10 @@ class TrajLoss(nn.Module):
         or a dictionary
         :return:
         """
-        # Unpack arguments
-        traj = traj_preds # (b, nmodes, seq, 5)
-        log_probs = traj_prob
-        traj_gt = gt_future_traj
+        # Unpack arguments and cast to float32 to prevent FP16 overflow in NLL / probability calculations
+        traj = traj_preds.float() # (b, nmodes, seq, 5)
+        log_probs = traj_prob.float()
+        traj_gt = gt_future_traj.float()
 
         # Useful variables
         batch_size = traj.shape[0]
@@ -113,7 +113,7 @@ def min_ade(traj: torch.Tensor, traj_gt: torch.Tensor,
     err = traj_gt_rpt - traj[:, :, :, 0:2]
     err = torch.pow(err, exponent=2)
     err = torch.sum(err, dim=3)
-    err = torch.pow(err, exponent=0.5)
+    err = torch.pow(err + 1e-7, exponent=0.5)
     err = torch.sum(err * (1 - masks_rpt), dim=2) / \
         torch.clip(torch.sum((1 - masks_rpt), dim=2), min=1)
     err, inds = torch.min(err, dim=1)
@@ -138,6 +138,15 @@ def traj_nll(
     shape [batch_size, sequence_length]
     :return:
     """
+    pred_dist = pred_dist.float()
+    traj_gt = traj_gt.float()
+    masks = masks.float()
+
+    if torch.isnan(pred_dist).any():
+        print("[TrajLoss NLL Debug] pred_dist contains NaN in forward!", flush=True)
+    if torch.isnan(traj_gt).any():
+        print("[TrajLoss NLL Debug] traj_gt contains NaN in forward!", flush=True)
+
     mu_x = pred_dist[:, :, 0]
     mu_y = pred_dist[:, :, 1]
     x = traj_gt[:, :, 0]
@@ -146,21 +155,35 @@ def traj_nll(
     sig_x = pred_dist[:, :, 2]
     sig_y = pred_dist[:, :, 3]
     rho = pred_dist[:, :, 4]
+
+    # Clamp parameters to prevent NaN gradients in backward pass
+    rho = torch.clamp(rho, min=-0.85, max=0.85)
+    sig_x = torch.clamp(sig_x, min=0.05, max=2.0)
+    sig_y = torch.clamp(sig_y, min=0.05, max=2.0)
+
     ohr = torch.pow(1 - torch.pow(rho, 2), -0.5)
 
-    nll = 0.5 * torch.pow(ohr, 2) * \
-        (torch.pow(sig_x, 2) * torch.pow(x - mu_x, 2) + torch.pow(sig_y, 2) *
-         torch.pow(y - mu_y, 2) - 2 * rho * torch.pow(sig_x, 1) *
-         torch.pow(sig_y, 1) * (x - mu_x) * (y - mu_y)) - \
+    # Clamp the trajectory errors to prevent extreme error squaring from exploding the gradients
+    err_x = torch.clamp(x - mu_x, min=-10.0, max=10.0)
+    err_y = torch.clamp(y - mu_y, min=-10.0, max=10.0)
+    err_x_sq = torch.pow(err_x, 2)
+    err_y_sq = torch.pow(err_y, 2)
+
+    term_x = torch.pow(sig_x, 2) * err_x_sq
+    term_y = torch.pow(sig_y, 2) * err_y_sq
+    term_cross = 2 * rho * sig_x * sig_y * err_x * err_y
+
+    nll = 0.5 * torch.pow(ohr, 2) * (term_x + term_y - term_cross) - \
         torch.log(sig_x * sig_y * ohr) + 1.8379
+
+    num_nan = torch.isnan(nll).sum().item()
+    if num_nan > 0:
+        print(f"[TrajLoss NLL Debug] nll has {num_nan} NaNs in forward before masking!", flush=True)
 
     nll[nll.isnan()] = 0
     nll[nll.isinf()] = 0
 
     nll = torch.sum(nll * (1 - masks), dim=1) / (torch.sum((1 - masks), dim=1) + 1e-5)
-    # Note: Normalizing with torch.sum((1 - masks), dim=1) makes values
-    # somewhat comparable for trajectories of
-    # different lengths
 
     return nll
 
@@ -194,7 +217,7 @@ def min_fde(traj: torch.Tensor, traj_gt: torch.Tensor,
     err = traj_gt_last - traj_last[..., 0:2]
     err = torch.pow(err, exponent=2)
     err = torch.sum(err, dim=2)
-    err = torch.pow(err, exponent=0.5)
+    err = torch.pow(err + 1e-7, exponent=0.5)
     err, inds = torch.min(err, dim=1)
 
     return err, inds
@@ -224,7 +247,7 @@ def miss_rate(
     dist = traj_gt_rpt - traj[:, :, :, 0:2]
     dist = torch.pow(dist, exponent=2)
     dist = torch.sum(dist, dim=3)
-    dist = torch.pow(dist, exponent=0.5)
+    dist = torch.pow(dist + 1e-7, exponent=0.5)
     dist[masks_rpt.bool()] = -math.inf
     dist, _ = torch.max(dist, dim=2)
     dist, _ = torch.min(dist, dim=1)

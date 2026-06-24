@@ -14,8 +14,22 @@ MASTER_PORT=${MASTER_PORT:-54621}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 RANK=${RANK:-0}
 
-WORK_DIR=$(echo ${CFG%.*} | sed -e "s/configs/work_dirs/g")/
-# Intermediate files and logs will be saved to UniAD/projects/work_dirs/
+# Extract work_dir from config file; fall back to auto-derived path
+WORK_DIR=$(python -c "
+import sys, re
+with open('${CFG}') as f:
+    content = f.read()
+m = re.search(r'work_dir\s*=\s*[\"\\']([^\"\\']*)[\"\\']\s*', content)
+if m:
+    print(m.group(1))
+" 2>/dev/null)
+
+if [ -z "${WORK_DIR}" ]; then
+    WORK_DIR=$(echo ${CFG%.*} | sed -e "s/configs/work_dirs/g")
+fi
+
+# Ensure trailing slash
+WORK_DIR="${WORK_DIR%/}/"
 
 if [ ! -d ${WORK_DIR}logs ]; then
     mkdir -p ${WORK_DIR}logs
