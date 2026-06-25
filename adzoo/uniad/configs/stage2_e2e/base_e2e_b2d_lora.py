@@ -15,7 +15,7 @@
 _base_ = ["./base_e2e_b2d.py"]
 
 # 预训练权重
-load_from = "/data/Bench2DriveZoo/adzoo/uniad/new_work_dirs/stage1/ablation/0.4r=16/iter_3000.pth"
+load_from = "ckpts/uniad_base_b2d.pth"
 
 # ── 目标场景定义 ──
 target_scenarios = ["ParkedObstacleTwoWays"]
@@ -66,7 +66,7 @@ model = dict(
         planning_lora=dict(r=16, alpha=32),    # Stage 3 PlanningHead: scale=2
         inject_q2o_feat=True,  # 向 query_to_occ_feat 注入 LoRA；False 用于消融/旧权重兼容
         pretrained_path="ckpts/uniad_base_b2d.pth",
-        training_stage=2,  # 切换阶段：1=Motion / 2=OCC / 3=Planning+Motion联合
+        training_stage=1,  # 切换阶段：1=Motion / 2=OCC / 3=Planning+Motion联合
     ),
     task_loss_weight=dict(
         track=1.0,
@@ -103,8 +103,8 @@ data = dict(
         oversample_cfg=dict(
             enable=True,                            # True 时启用
             scenarios=target_scenarios,              # 要过采样的场景
-            ratio=0,                                 # 额外复制
-            max_other_frames=42780,               # 其他场景限制帧数
+            ratio=1,                                 # 额外复制
+            max_other_frames=22648,               # 其他场景限制帧数
             seed=42,
         ),
     ),
@@ -132,7 +132,7 @@ evaluation = dict(
     early_stopping=dict(
         metric='auto',            # 自动匹配训练阶段: stage1→motion_min_ade, stage2→occ_iou, stage3→planning_L2
         rule='auto',              # 自动匹配: motion/planning→less, occ→greater
-        patience=5,               # 连续 5 次验证不改善则停止（=2500 iter）
+        patience=6,               
         min_delta=0.001,          # 改善需超过阈值才算有效
         warmup_iters=500,         # 前 500 iter 不触发早停（warmup 阶段）
     )

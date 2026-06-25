@@ -166,22 +166,47 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
 
                             # pred_traj_agents: (N_pred, modes, T, feat)
                             # gt_fut_traj: (N_gt, T, 2)
-                            # Match by taking min(N_pred, N_gt) agents
+                            # 使用贪心最近邻匹配，防止因为浮点误差抖动导致多检测/少检测框而产生“顺延错位”
                             N_pred = pred_traj_agents.shape[0]
                             N_gt = gt_fut_traj.shape[0]
-                            N = min(N_pred, N_gt)
-                            if N > 0:
-                                pred_input = pred_traj_agents[:N]  # (N, modes, T, feat)
-                                gt_input = gt_fut_traj[:N, :, :2]  # (N, T, 2)
-                                mask_input = gt_mask[:N]  # (N, T)
-                                # Only take xy coords from pred
-                                if pred_input.shape[-1] > 2:
-                                    pred_input = pred_input[..., :2]  # (N, modes, T, 2)
-                                motion_metrics.update(
-                                    pred_input.cuda(),
-                                    gt_input.cuda(),
-                                    mask_input.cuda()
-                                )
+                            if N_pred > 0 and N_gt > 0:
+                                pred_starts = pred_traj_agents[:, 0, 0, :2].cuda().float()
+                                gt_starts = gt_fut_traj[:, 0, :2].cuda().float()
+                                # 计算成对距离矩阵 [N_pred, N_gt]
+                                dist = torch.cdist(pred_starts.unsqueeze(0), gt_starts.unsqueeze(0)).squeeze(0)
+                                
+                                matched_pred = []
+                                matched_gt = []
+                                threshold = 4.0  # 4米匹配半径阈值
+                                
+                                dist_flat = dist.flatten()
+                                sorted_indices = torch.argsort(dist_flat)
+                                used_pred = set()
+                                used_gt = set()
+                                
+                                for idx in sorted_indices.tolist():
+                                    i = idx // N_gt
+                                    j = idx % N_gt
+                                    if dist[i, j] > threshold:
+                                        break
+                                    if i not in used_pred and j not in used_gt:
+                                        matched_pred.append(i)
+                                        matched_gt.append(j)
+                                        used_pred.add(i)
+                                        used_gt.add(j)
+                                
+                                if len(matched_pred) > 0:
+                                    pred_input = pred_traj_agents[matched_pred].cuda()
+                                    gt_input = gt_fut_traj[matched_gt, :, :2].cuda()
+                                    mask_input = gt_mask[matched_gt].cuda()
+                                    # Only take xy coords from pred
+                                    if pred_input.shape[-1] > 2:
+                                        pred_input = pred_input[..., :2]  # (N, modes, T, 2)
+                                    motion_metrics.update(
+                                        pred_input,
+                                        gt_input,
+                                        mask_input
+                                    )
 
             # # Eval Occ
             if eval_occ:

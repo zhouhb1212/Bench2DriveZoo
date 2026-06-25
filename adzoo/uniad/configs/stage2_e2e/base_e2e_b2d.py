@@ -737,6 +737,7 @@ inference_only_pipeline = [
         ],
     ),
 ]
+eval_scenario_filter = ["ParkedObstacleTwoWays"] # 设为 None 则对全量验证集进行评估
 
 data = dict(
     samples_per_gpu=1,
@@ -779,6 +780,7 @@ data = dict(
         eval_cfg=eval_cfg,
         #eval_mod=['det', 'track', 'map'],
         box_type_3d="LiDAR",
+        scenario_filter=eval_scenario_filter,
     ),
     test=dict(
         type=dataset_type,
@@ -799,6 +801,7 @@ data = dict(
         eval_cfg=eval_cfg,
         #eval_mod=['det', 'track', 'map'],
         box_type_3d="LiDAR",
+        scenario_filter=eval_scenario_filter,
     ),
     shuffler_sampler=dict(type="DistributedGroupSampler"),
     nonshuffler_sampler=dict(type="DistributedSampler"),
