@@ -18,6 +18,8 @@ if [ ! -d ${WORK_DIR}logs ]; then
     mkdir -p ${WORK_DIR}logs
 fi
 
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
 PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
 python -m torch.distributed.launch \
     --nproc_per_node=$GPUS_PER_NODE \
@@ -28,4 +30,5 @@ python -m torch.distributed.launch \
     --launcher pytorch ${@:4} \
     --eval bbox \
     --show-dir ${WORK_DIR} \
+    --deterministic \
     2>&1 | tee ${WORK_DIR}logs/eval.$T

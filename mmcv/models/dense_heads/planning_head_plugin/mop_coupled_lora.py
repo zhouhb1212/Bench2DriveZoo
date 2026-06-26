@@ -20,7 +20,7 @@ def _disable_transformer_fastpath(tfl):
         tfl.activation_relu_or_gelu = 0
 
 
-class OccPlanCoupledLoRA:
+class MOPCoupledLoRA:
     """
     Motion-Occupancy-Planning LoRA 管理器。
 
@@ -214,7 +214,7 @@ class OccPlanCoupledLoRA:
             - mlp_fuser[0]  (Linear 768→256)
             - reg_branch[0] (Linear 256→256), reg_branch[2] (Linear 256→planning_steps*2)
             - attn_module 每层: self_attn / multihead_attn → LoRAMultiheadAttention
-                                linear1 / linear2 → LoRALinear
+                                 linear1 / linear2 → LoRALinear
             - bev_adapter Conv2d: 冻结不注入
         """
         r, alpha, dropout = self.plan_r, self.plan_alpha, self.plan_dropout
@@ -389,7 +389,7 @@ class OccPlanCoupledLoRA:
         total_params = motion_total + occ_total + plan_total
 
         info = (
-            f"[OccPlanCoupledLoRA] Stage {self._current_stage}\n"
+            f"[MOPCoupledLoRA] Stage {self._current_stage}\n"
             f"  Motion  LoRA (r={self.motion_r}, alpha={self.motion_alpha}): "
             f"{motion_trainable:,} / {motion_total:,} "
             f"({100*motion_trainable/max(motion_total,1):.1f}%)\n"

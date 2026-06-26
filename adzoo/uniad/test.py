@@ -76,9 +76,15 @@ def main():
         distributed = False
     else:
         distributed = True
-        torch.backends.cudnn.benchmark = True
         init_dist(args.launcher, **cfg.dist_params)
         rank, world_size = get_dist_info()
+
+    if args.deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    elif distributed:
+        torch.backends.cudnn.benchmark = True
 
     set_random_seed(args.seed, deterministic=args.deterministic)
 

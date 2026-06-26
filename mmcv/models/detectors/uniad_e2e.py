@@ -114,9 +114,9 @@ class UniAD(UniADTrack):
                 if motion_state and hasattr(self, 'motion_head'):
                     self.motion_head.load_state_dict(motion_state, strict=False)
 
-            from ..dense_heads.planning_head_plugin.occ_plan_coupled_lora import OccPlanCoupledLoRA
+            from ..dense_heads.planning_head_plugin.mop_coupled_lora import MOPCoupledLoRA
             motion_head_ref = self.motion_head if hasattr(self, 'motion_head') else None
-            self.coupled_lora = OccPlanCoupledLoRA(
+            self.coupled_lora = MOPCoupledLoRA(
                 self.occ_head, self.planning_head, coupled_lora_cfg,
                 motion_head=motion_head_ref)
             self.coupled_lora.inject()
@@ -341,9 +341,9 @@ class UniAD(UniADTrack):
             outs_motion['bev_pos'] = bev_pos
             losses_motion = ret_dict_motion["losses"]
             losses_motion = self.loss_weighted_and_prefixed(losses_motion, prefix='motion')
-            # Stage 1: motion loss 参与反向传播（训练 Motion LoRA）
+            # Stage 1 & Stage 3: motion loss 参与反向传播（训练 Motion LoRA）
             # 其他 Stage: motion loss 仅作为监控指标
-            if stage1_only:
+            if stage1_only or (self.coupled_lora is not None and self.coupled_lora.get_current_stage() == 3):
                 losses.update(losses_motion)
             else:
                 monitoring_losses.update(losses_motion)
@@ -450,9 +450,12 @@ class UniAD(UniADTrack):
             else:
                 self.prev_frame_info = self.prev_frame_infos.pop(0)
 
-        if img_metas[0][0]['scene_token'] != self.prev_frame_info['scene_token']:
-            # the first sample of each scene is truncated
+        is_first_frame = False
+        if self.prev_frame_info['scene_token'] is None or img_metas[0][0]['scene_token'] != self.prev_frame_info['scene_token']:
+            is_first_frame = True
             self.prev_frame_info['prev_bev'] = None
+            if self.prev_frame_num > 0:
+                self.prev_frame_infos = []
         # update idx
         self.prev_frame_info['scene_token'] = img_metas[0][0]['scene_token']
 
@@ -464,7 +467,7 @@ class UniAD(UniADTrack):
         tmp_pos = copy.deepcopy(img_metas[0][0]['can_bus'][:3])
         tmp_angle = copy.deepcopy(img_metas[0][0]['can_bus'][-1])
         # first frame
-        if self.prev_frame_info['scene_token'] is None:
+        if is_first_frame:
             img_metas[0][0]['can_bus'][:3] = 0
             img_metas[0][0]['can_bus'][-1] = 0
         # following frames
