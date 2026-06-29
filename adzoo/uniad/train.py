@@ -267,9 +267,13 @@ def main():
         from mmcv.optims.optimizer import OPTIMIZERS
         optimizer_cfg = copy.deepcopy(cfg.optimizer)
         optimizer_cfg.pop('paramwise_cfg', None)
+        
+        current_stage = inner.coupled_lora.get_current_stage()
         optimizer_cfg['params'] = [p for p in inner.coupled_lora.get_lora_params() if p.requires_grad]
+            
         optimizer = build_from_cfg(optimizer_cfg, OPTIMIZERS)
-        logger.info(f'[LoRA] Optimizer built with {sum(p.numel() for p in optimizer_cfg["params"]):,} params')
+        n_params = sum(p.numel() for p in optimizer_cfg['params'])
+        logger.info(f'[LoRA Stage {current_stage}] Optimizer built with {n_params:,} trainable params (lr={optimizer_cfg["lr"]:.2e})')
     else:
         optimizer = build_optimizer(model, cfg.optimizer)
 

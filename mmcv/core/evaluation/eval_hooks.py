@@ -208,7 +208,7 @@ def evaluate_with_composite(hook, runner, results):
         if hook.key_indicator == 'composite_iou_pq':
             iou = eval_res.get('occ/iou_30x30', 0.0)
             pq = eval_res.get('occ/pq_30x30', 0.0)
-            composite_score = 0.5 * iou + 0.5 * pq
+            composite_score = 0.6 * iou + 0.4 * pq
             runner.log_buffer.output['composite_iou_pq'] = composite_score
             return composite_score
 

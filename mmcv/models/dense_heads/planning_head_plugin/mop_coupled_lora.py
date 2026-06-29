@@ -284,8 +284,9 @@ class MOPCoupledLoRA:
             self._set_lora_trainable(self.occ_head, True)
         elif stage == 3:
             self._set_lora_trainable(self.planning_head, True)
-            if self.motion_head is not None:
-                self._set_lora_trainable(self.motion_head, True)
+            # Motion LoRA 保持冻结：防止 planning 梯度通过共享的 sdc_traj_query
+            # 回传到 motion LoRA，导致 motion 表征漂移（moving target 问题）。
+            # Planning LoRA 在 motion 提供的稳定表征上学习，才能正常收敛。
 
         # 冻结所有 LayerNorm
         self._freeze_layernorm()

@@ -89,8 +89,8 @@ class UniAD(UniADTrack):
         if planning_head:
             self.planning_head = build_head(planning_head)
 
-        self.task_loss_weight = task_loss_weight
-        assert set(task_loss_weight.keys()) == \
+        self.task_loss_weight = copy.deepcopy(task_loss_weight)
+        assert set(self.task_loss_weight.keys()) == \
                {'track', 'occ', 'motion', 'map', 'planning'}
 
         # Occupancy-Planning-Motion Coupled LoRA (三阶段训练管理器)
@@ -341,9 +341,10 @@ class UniAD(UniADTrack):
             outs_motion['bev_pos'] = bev_pos
             losses_motion = ret_dict_motion["losses"]
             losses_motion = self.loss_weighted_and_prefixed(losses_motion, prefix='motion')
-            # Stage 1 & Stage 3: motion loss 参与反向传播（训练 Motion LoRA）
+            # Stage 1: motion loss 参与反向传播（训练 Motion LoRA）
+            # Stage 3: motion LoRA 已冻结，motion loss 梯度无法更新任何参数，仅作监控
             # 其他 Stage: motion loss 仅作为监控指标
-            if stage1_only or (self.coupled_lora is not None and self.coupled_lora.get_current_stage() == 3):
+            if stage1_only:
                 losses.update(losses_motion)
             else:
                 monitoring_losses.update(losses_motion)
@@ -381,6 +382,24 @@ class UniAD(UniADTrack):
                 command, gt_future_boxes)
             losses_planning = outs_planning['losses']
             losses_planning = self.loss_weighted_and_prefixed(losses_planning, prefix='planning')
+            
+            # Stage 3 场景过滤：如果当前样本非目标场景 ParkedObstacleTwoWays，
+            # 将规划损失乘以 0.0，防止其他普通场景的“必须居中行驶”梯度快速抹杀/破坏已有的借道绕行能力。
+            # 这既能保证三阶段的数据集分布保持完全一致，又避免了非目标场景梯度的负面干扰。
+            if self.coupled_lora is not None and self.coupled_lora.get_current_stage() == 3:
+                # 检查开关是否开启，默认为 True
+                filter_non_target = getattr(self.coupled_lora, 'lora_cfg', {}).get('filter_non_target_planning_loss', True)
+                if filter_non_target:
+                    is_target_scenario = True
+                    if img_metas is not None and len(img_metas) > 0 and 'folder' in img_metas[0]:
+                        folder = img_metas[0]['folder']
+                        scenario = folder.rsplit('/', 1)[-1].split('_', 1)[0]
+                        if scenario != "ParkedObstacleTwoWays":
+                            is_target_scenario = False
+                    if not is_target_scenario:
+                        for k in losses_planning.keys():
+                            losses_planning[k] = losses_planning[k] * 0.0
+            
             losses.update(losses_planning)
 
         # 精简监控 loss：每个冻结 head 只保留最典型的一个，用于判断特征质量是否稳定

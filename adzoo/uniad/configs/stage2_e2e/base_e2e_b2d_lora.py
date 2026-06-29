@@ -15,7 +15,7 @@
 _base_ = ["./base_e2e_b2d.py"]
 
 # 预训练权重
-load_from = "/data/Bench2DriveZoo/ckpts/uniad_base_b2d.pth"
+load_from = "/data/Bench2DriveZoo/adzoo/uniad/new_work_dirs/stage2/iter_7500.pth"
 
 # ── 目标场景定义 ──
 target_scenarios = ["ParkedObstacleTwoWays"]
@@ -32,11 +32,11 @@ if "ParkedObstacleTwoWays" in target_scenarios:
             dict(type='RelativeCollisionLoss', delta=0.25, weight=0.04),
             dict(type='RelativeCollisionLoss', delta=0.5, weight=0.01)
         ],
-        loss_direction=dict(type='PlanningDirectionLoss', weight=0.5),
+        loss_direction=None,  # Disabled to prevent gradient explosion
         col_optim_args=dict(
             occ_filter_range=7.5,     # 从 5.0 增大到 7.5，更早避让障碍
-            sigma=1.0,
-            alpha_collision=10.0,     # 增强避障排斥力度，从 8.0 增大到 10.0
+            sigma=0.5,
+            alpha_collision=8.0,     # 避障排斥力度
         )
     )
 else:
@@ -57,16 +57,17 @@ model = dict(
         compute_aux_loss=False,
     ),
     coupled_lora_cfg=dict(
-        r=32,            # 增大 LoRA 秩，从 16 增大到 32 提升参数容量
+        r=16,            # 增大 LoRA 秩，从 16 增大到 32 提升参数容量
         alpha=32,        # scale = alpha/r = 1（全局默认值；per-head 配置优先）
-        dropout=0.1,     # 调大 dropout（原 0.05）防止对小样本过拟合
+        dropout=0.1,     # 调大 dropout 防止对小样本过拟合
         # Per-head LoRA 参数覆写（可选，不指定时回退到全局默认值）
         motion_lora=dict(r=32, alpha=64),      # Stage 1 Motion: scale=2
-        occ_lora=dict(r=32, alpha=64),         # Stage 2 OccHead: scale=2
-        planning_lora=dict(r=32, alpha=64),    # Stage 3 PlanningHead: scale=2
+        occ_lora=dict(r=16, alpha=32),         # Stage 2 OccHead: scale=2
+        planning_lora=dict(r=16, alpha=32),    # Stage 3 PlanningHead: scale=2
         inject_q2o_feat=True,  # 向 query_to_occ_feat 注入 LoRA；False 用于消融/旧权重兼容
         pretrained_path="ckpts/uniad_base_b2d.pth",
-        training_stage=1,  # 切换阶段：1=Motion / 2=OCC / 3=Planning+Motion联合
+        training_stage=3,  # 切换阶段：1=Motion / 2=OCC / 3=Planning+Motion联合
+        filter_non_target_planning_loss=True,  # 是否在 Stage 3 训练中屏蔽非目标场景的规划损失
     ),
     motion_head=dict(
         loss_traj=dict(
@@ -74,8 +75,8 @@ model = dict(
             use_variance=True,
             cls_loss_weight=0.5,
             nll_loss_weight=0.5,
-            loss_weight_minade=0.5,            # 恢复 ADE 约束（原 0.0），稳定绕行轨迹形状并辅助终点优化
-            loss_weight_minfde=1.0,            # FDE 损失权重从 0.25 提高到 1.0，强力约束终点误差
+            loss_weight_minade=0,            #稳定绕行轨迹形状并辅助终点优化
+            loss_weight_minfde=0.75,            # FDE 损失权重，强力约束终点误差
         )
     ),
     task_loss_weight=dict(
@@ -91,8 +92,8 @@ model = dict(
 # ── 优化器（仅 LoRA 参数 requires_grad=True，其余已冻结）──
 optimizer = dict(
     type="AdamW",
-    lr=1e-4,      # 降低学习率，防止在小样本上更新过猛导致过拟合
-    weight_decay=0.05,  # 增大权重衰减L2 正则化作用防止过拟合
+    lr=5e-6,      # 降低学习率，防止在小样本上更新过猛导致过拟合
+    weight_decay=0.1,  # 增大权重衰减L2 正则化作用防止过拟合
 )
 
 # ── 输出路径 ──
@@ -113,8 +114,8 @@ data = dict(
         oversample_cfg=dict(
             enable=True,                            # True 时启用
             scenarios=target_scenarios,              # 要过采样的场景
-            ratio=1,                                 # 额外复制
-            max_other_frames=60396,               # 其他场景限制帧数
+            ratio=0,                                 # 额外复制
+            max_other_frames=67945,               # 其他场景限制帧数
             seed=42,
         ),
     ),
@@ -142,8 +143,8 @@ evaluation = dict(
     early_stopping=dict(
         metric='auto',            # 自动匹配训练阶段: stage1→motion_min_ade, stage2→occ_iou, stage3→planning_L2
         rule='auto',              # 自动匹配: motion/planning→less, occ→greater
-        patience=6,               
-        min_delta=0.001,          # 改善需超过阈值才算有效
+        patience=10,               
+        min_delta=0,          # 改善需超过阈值才算有效
         warmup_iters=500,         # 前 500 iter 不触发早停（warmup 阶段）
     )
 )
@@ -160,7 +161,7 @@ log_config = dict(
 # 使用较温和的初始 loss_scale (512.0) 避免 PyTorch GradScaler 默认 65536.0 导致前几步频繁 overflow
 optimizer_config = dict(
     type='GradientCumulativeFp16OptimizerHook',
-    cumulative_iters=16,  # 有效 batch_size=16 (1 GPU * 16 iters)
+    cumulative_iters=16,  # 有效 batch_size=16 
     grad_clip=dict(max_norm=5.0, norm_type=2),  
     loss_scale=dict(init_scale=512.0),
 )
