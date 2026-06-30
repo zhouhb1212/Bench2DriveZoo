@@ -23,12 +23,36 @@ from mmcv.datasets.pipelines import Compose
 from mmcv.parallel.collate import collate as  mm_collate_to_batch_form
 from mmcv.core.bbox import get_box_type
 from pyquaternion import Quaternion
+from scipy.interpolate import splprep, splev
 from scipy.optimize import fsolve
+import seaborn as sns
+import copy
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
 
 def get_entry_point():
     return 'UniadAgent'
+
+
+def float_to_uint8_color(float_clr):
+    assert all([c >= 0. for c in float_clr])
+    assert all([c <= 1. for c in float_clr])
+    return [int(c * 255.) for c in float_clr]
+
+
+COLORS = [float_to_uint8_color(clr) for clr in sns.color_palette("bright", n_colors=10)]
+COLORMAP = OrderedDict({
+    6: COLORS[8],  # yellow
+    4: COLORS[8],
+    3: COLORS[0],  # blue
+    1: COLORS[6],  # pink
+    0: COLORS[2],  # green
+    8: COLORS[7],  # gray
+    7: COLORS[1],  # orange
+    5: COLORS[3],  # red
+    2: COLORS[5],  # brown
+})
+
 
 class UniadAgent(autonomous_agent.AutonomousAgent):
     def setup(self, path_to_conf_file):
@@ -373,6 +397,7 @@ class UniadAgent(autonomous_agent.AutonomousAgent):
                 if torch.is_tensor(data[0]):
                     data[0] = data[0].to(self.device)
         output_data_batch = self.model(input_data_batch, return_loss=False, rescale=True)
+        self._current_output = output_data_batch  # store for visualization
         out_truck =  output_data_batch[0]['planning']['result_planning']['sdc_traj'][0].cpu().numpy()
         steer_traj, throttle_traj, brake_traj, metadata_traj = self.pidcontroller.control_pid(out_truck, tick_data['speed'], local_command_xy)
         if brake_traj < 0.05: brake_traj = 0.0
@@ -395,19 +420,59 @@ class UniadAgent(autonomous_agent.AutonomousAgent):
         metric_info = self.get_metric_info()
         self.metric_info[self.step] = metric_info
         if SAVE_PATH is not None and self.step % 1 == 0:
-            self.save(tick_data)
+            self.save(tick_data, out_truck)
         self.prev_control = control
         return control
 
-    def save(self, tick_data):
-        frame = self.step // 10
-        Image.fromarray(tick_data['imgs']['CAM_FRONT']).save(self.save_path / 'rgb_front' / ('%04d.png' % frame))
-        Image.fromarray(tick_data['imgs']['CAM_FRONT_LEFT']).save(self.save_path / 'rgb_front_left' / ('%04d.png' % frame))
-        Image.fromarray(tick_data['imgs']['CAM_FRONT_RIGHT']).save(self.save_path / 'rgb_front_right' / ('%04d.png' % frame))
-        Image.fromarray(tick_data['imgs']['CAM_BACK']).save(self.save_path / 'rgb_back' / ('%04d.png' % frame))
-        Image.fromarray(tick_data['imgs']['CAM_BACK_LEFT']).save(self.save_path / 'rgb_back_left' / ('%04d.png' % frame))
-        Image.fromarray(tick_data['imgs']['CAM_BACK_RIGHT']).save(self.save_path / 'rgb_back_right' / ('%04d.png' % frame))
-        Image.fromarray(tick_data['bev']).save(self.save_path / 'bev' / ('%04d.png' % frame))
+    def save(self, tick_data, ego_traj=None):
+        frame = self.step  # save every frame (consistent with VAD visualize)
+        output = self._current_output[0] if hasattr(self, '_current_output') else None
+
+        imgs_with_box = {}
+        for cam in ['CAM_FRONT','CAM_FRONT_LEFT','CAM_FRONT_RIGHT','CAM_BACK','CAM_BACK_LEFT','CAM_BACK_RIGHT']:
+            img = tick_data['imgs'][cam]
+            # Try to draw 3D detection/tracking boxes
+            try:
+                if output is not None and 'pts_bbox' in output:
+                    img = self._draw_boxes_on_img(output['pts_bbox'], img,
+                                                   self.lidar2img[cam],
+                                                   canvas_size=(900, 1600))
+                elif output is not None and 'track_results' in output:
+                    img = self._draw_track_results(output, img,
+                                                    self.lidar2img[cam],
+                                                    canvas_size=(900, 1600))
+            except Exception:
+                pass  # skip visualization errors, keep raw image
+            imgs_with_box[cam] = img
+
+        # BEV image with annotations
+        bev_img = tick_data['bev'].copy()
+        try:
+            if output is not None and 'pts_bbox' in output:
+                bev_img = self._draw_boxes_on_img(output['pts_bbox'], bev_img,
+                                                   self.coor2topdown,
+                                                   canvas_size=(512, 512))
+            # Draw ego trajectory on BEV
+            if ego_traj is not None:
+                bev_img = self._draw_traj_bev(ego_traj, bev_img, is_ego=True)
+        except Exception:
+            pass
+
+        # Draw ego trajectory on front camera
+        if ego_traj is not None:
+            try:
+                imgs_with_box['CAM_FRONT'] = self._draw_traj(ego_traj,
+                                                              imgs_with_box['CAM_FRONT'])
+            except Exception:
+                pass
+
+        # Save all annotated images
+        for cam, img in imgs_with_box.items():
+            cam_dir = 'rgb_' + cam.lower().replace('cam_', '')
+            Image.fromarray(img).save(self.save_path / cam_dir / ('%04d.png' % frame))
+        Image.fromarray(bev_img).save(self.save_path / 'bev' / ('%04d.png' % frame))
+
+        # Save metadata
         outfile = open(self.save_path / 'meta' / ('%04d.json' % frame), 'w')
         json.dump(self.pid_metadata, outfile, indent=4)
         outfile.close()
@@ -416,6 +481,190 @@ class UniadAgent(autonomous_agent.AutonomousAgent):
         outfile = open(self.save_path / 'metric_info.json', 'w')
         json.dump(self.metric_info, outfile, indent=4)
         outfile.close()
+
+    # ── Drawing helper methods ──
+
+    def _draw_traj(self, traj, raw_img, canvas_size=(900, 1600), thickness=3,
+                    is_ego=True, hue_start=120, hue_end=80):
+        """Draw ego trajectory on front camera image using lidar2img projection."""
+        line = traj
+        lidar2img_rt = self.lidar2img['CAM_FRONT']
+        img = raw_img.copy()
+        pts_4d = np.stack([line[:, 0], line[:, 1],
+                           np.ones((line.shape[0])) * (-1.84),
+                           np.ones((line.shape[0]))])
+        pts_2d = ((lidar2img_rt @ pts_4d).T)
+        pts_2d[:, 0] /= pts_2d[:, 2]
+        pts_2d[:, 1] /= pts_2d[:, 2]
+        mask = ((pts_2d[:, 0] > 0) & (pts_2d[:, 0] < canvas_size[1]) &
+                (pts_2d[:, 1] > 0) & (pts_2d[:, 1] < canvas_size[0]))
+        if not mask.any():
+            return img
+        pts_2d = pts_2d[mask, 0:2]
+        if is_ego:
+            pts_2d = np.concatenate([np.array([[800, 900]]), pts_2d], axis=0)
+        try:
+            tck, u = splprep([pts_2d[:, 0], pts_2d[:, 1]], s=0)
+        except Exception:
+            return img
+        unew = np.linspace(0, 1, 100)
+        smoothed_pts = np.stack(splev(unew, tck)).astype(int).T
+        num_points = len(smoothed_pts)
+        for i in range(num_points - 1):
+            hue = hue_start + (hue_end - hue_start) * (i / num_points)
+            hsv_color = np.array([hue, 255, 255], dtype=np.uint8)
+            rgb_color = cv2.cvtColor(hsv_color[np.newaxis, np.newaxis, :],
+                                      cv2.COLOR_HSV2RGB).reshape(-1)
+            rgb_color_tuple = (float(rgb_color[0]), float(rgb_color[1]),
+                                float(rgb_color[2]))
+            cv2.line(img, (smoothed_pts[i, 0], smoothed_pts[i, 1]),
+                     (smoothed_pts[i + 1, 0], smoothed_pts[i + 1, 1]),
+                     color=rgb_color_tuple, thickness=thickness)
+        return img
+
+    def _draw_traj_bev(self, traj, raw_img, canvas_size=(512, 512), thickness=3,
+                        is_ego=True, hue_start=120, hue_end=80):
+        """Draw ego trajectory on BEV image."""
+        if is_ego:
+            line = np.concatenate([np.zeros((1, 2)), traj], axis=0)
+        else:
+            line = traj
+        img = raw_img.copy()
+        pts_4d = np.stack([line[:, 0], line[:, 1],
+                           np.zeros((line.shape[0])),
+                           np.ones((line.shape[0]))])
+        pts_2d = (self.coor2topdown @ pts_4d).T
+        pts_2d[:, 0] /= pts_2d[:, 2]
+        pts_2d[:, 1] /= pts_2d[:, 2]
+        mask = ((pts_2d[:, 0] > 0) & (pts_2d[:, 0] < canvas_size[1]) &
+                (pts_2d[:, 1] > 0) & (pts_2d[:, 1] < canvas_size[0]))
+        if not mask.any():
+            return img
+        pts_2d = pts_2d[mask, 0:2]
+        try:
+            tck, u = splprep([pts_2d[:, 0], pts_2d[:, 1]], s=0)
+        except Exception:
+            return img
+        unew = np.linspace(0, 1, 100)
+        smoothed_pts = np.stack(splev(unew, tck)).astype(int).T
+        num_points = len(smoothed_pts)
+        for i in range(num_points - 1):
+            hue = hue_start + (hue_end - hue_start) * (i / num_points)
+            hsv_color = np.array([hue, 255, 255], dtype=np.uint8)
+            rgb_color = cv2.cvtColor(hsv_color[np.newaxis, np.newaxis, :],
+                                      cv2.COLOR_HSV2RGB).reshape(-1)
+            rgb_color_tuple = (float(rgb_color[0]), float(rgb_color[1]),
+                                float(rgb_color[2]))
+            if (smoothed_pts[i, 0] > 0 and smoothed_pts[i, 0] < canvas_size[1] and
+                smoothed_pts[i, 1] > 0 and smoothed_pts[i, 1] < canvas_size[0]):
+                cv2.line(img, (smoothed_pts[i, 0], smoothed_pts[i, 1]),
+                         (smoothed_pts[i + 1, 0], smoothed_pts[i + 1, 1]),
+                         color=rgb_color_tuple, thickness=thickness)
+            elif i == 0:
+                break
+        return img
+
+    def _draw_boxes_on_img(self, pts_bbox, raw_img, lidar2img_rt,
+                            canvas_size=(900, 1600), thickness=1):
+        """Draw 3D bboxes from model output on image or BEV."""
+        bboxes3d = pts_bbox.get('boxes_3d', None)
+        if bboxes3d is None:
+            return raw_img
+        scores = pts_bbox.get('scores_3d', None)
+        labels = pts_bbox.get('labels_3d', None)
+        trajs = pts_bbox.get('trajs_3d', None)
+
+        img = raw_img.copy()
+        bboxes3d_numpy = bboxes3d.tensor.cpu().numpy()
+        if len(bboxes3d_numpy) == 0:
+            return img
+
+        corners_3d = bboxes3d.corners
+        num_bbox = corners_3d.shape[0]
+        pts_4d = np.concatenate(
+            [corners_3d.reshape(-1, 3),
+             np.ones((num_bbox * 8, 1))], axis=-1)
+        lidar2img_rt = copy.deepcopy(lidar2img_rt).reshape(4, 4)
+        if isinstance(lidar2img_rt, torch.Tensor):
+            lidar2img_rt = lidar2img_rt.cpu().numpy()
+        if isinstance(scores, torch.Tensor):
+            scores = scores.cpu().numpy()
+        if isinstance(labels, torch.Tensor):
+            labels = labels.cpu().numpy()
+
+        pts_2d = (lidar2img_rt @ pts_4d.T).T
+        pts_2d[:, 0] /= pts_2d[:, 2]
+        pts_2d[:, 1] /= pts_2d[:, 2]
+        imgfov_pts_2d = pts_2d[..., :2].reshape(num_bbox, 8, 2)
+        depth = pts_2d[..., 2].reshape(num_bbox, 8)
+        mask1 = ((imgfov_pts_2d[:, :, 0] > -1e5) &
+                 (imgfov_pts_2d[:, :, 0] < 1e5) &
+                 (imgfov_pts_2d[:, :, 1] > -1e5) &
+                 (imgfov_pts_2d[:, :, 1] < 1e5) &
+                 (depth > -1)).all(-1)
+        mask2 = ((imgfov_pts_2d.reshape(num_bbox, 16).max(axis=-1) -
+                  imgfov_pts_2d.reshape(num_bbox, 16).min(axis=-1)) < 2000)
+        mask = mask1 & mask2
+        if scores is not None:
+            mask3 = (scores >= 0.3)
+            mask = mask & mask3
+        if not mask.any():
+            return img
+
+        scores = scores[mask] if scores is not None else None
+        labels = labels[mask] if labels is not None else None
+        imgfov_pts_2d = imgfov_pts_2d[mask]
+        num_bbox = mask.sum()
+
+        # Draw agent future trajectories on BEV
+        if trajs is not None:
+            trajs = trajs[mask]
+            agent_boxes = bboxes3d_numpy[mask]
+            for traj, agent_box, label in zip(trajs, agent_boxes, labels):
+                if label in [0, 1, 2, 3, 7]:
+                    for i in range(min(6, traj.shape[0])):
+                        traj1 = np.concatenate(
+                            [np.zeros((1, 2)), traj[i].reshape(6, 2)], axis=0)
+                        traj1 = np.cumsum(traj1, axis=0) + agent_box[None, 0:2]
+                        if canvas_size == (900, 1600):
+                            img = self._draw_traj(traj1, img,
+                                                   hue_start=0, hue_end=20)
+                        else:
+                            img = self._draw_traj_bev(traj1, img,
+                                                       hue_start=0, hue_end=20)
+
+        return self._plot_rect3d_on_img(img, num_bbox, imgfov_pts_2d,
+                                         scores, labels, thickness,
+                                         bev=(canvas_size != (900, 1600)))
+
+    def _draw_track_results(self, output, raw_img, lidar2img_rt,
+                             canvas_size=(900, 1600)):
+        """Draw boxes from UniAD tracking results (alternative output format)."""
+        # UniAD may output track results differently than VAD-style pts_bbox
+        if 'track_boxes' in output:
+            # Try to access tracking output - format depends on UniAD version
+            pass
+        return raw_img
+
+    def _plot_rect3d_on_img(self, img, num_rects, rect_corners,
+                              scores=None, labels=None, thickness=1,
+                              bev=False):
+        """Draw 3D bounding box edges on image."""
+        line_indices = ((0, 1), (0, 3), (0, 4), (1, 2), (1, 5),
+                        (3, 2), (3, 7), (4, 5), (4, 7), (2, 6), (5, 6), (6, 7))
+        if bev:
+            line_indices = ((0, 3), (3, 7), (4, 7), (0, 4))
+        for i in range(num_rects):
+            label = labels[i] if labels is not None else 0
+            c = COLORMAP.get(label, COLORS[0])
+            corners = rect_corners[i].astype(np.int32)
+            if scores is not None and scores[i] < 0.3:
+                continue
+            for start, end in line_indices:
+                cv2.line(img, (corners[start, 0], corners[start, 1]),
+                         (corners[end, 0], corners[end, 1]), c,
+                         thickness, cv2.LINE_AA)
+        return img.astype(np.uint8)
 
     def destroy(self):
         del self.model
