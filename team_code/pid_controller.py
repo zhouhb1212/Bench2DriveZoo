@@ -74,9 +74,9 @@ class PIDController(object):
         # use target point if it has a smaller angle or if error is large
         # predicted point otherwise
         # (reduces noise in eg. straight roads, helps with sudden turn commands)
-        use_target_to_aim = np.abs(angle_target) < np.abs(angle)
-        use_target_to_aim = use_target_to_aim or (np.abs(angle_target-angle_last) > self.angle_thresh and target[1] < self.dist_thresh)
-        if use_target_to_aim:
+        # If the predicted steering angle is very small (noise), we default to the target route angle for stability.
+        # Otherwise (during active bypass or turning), follow the model's predicted trajectory.
+        if np.abs(angle) < 0.03:
             angle_final = angle_target
         else:
             angle_final = angle

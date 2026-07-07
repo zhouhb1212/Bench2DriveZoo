@@ -35,7 +35,8 @@ def load_checkpoint_with_lora_mapping(runner, filename, strict=False, logger=Non
     else:
         state_dict = checkpoint
 
-    model_keys = runner.model.state_dict().keys()
+    model_state = runner.model.state_dict()
+    model_keys = model_state.keys()
     new_state_dict = {}
     mapped_count = 0
     
@@ -44,7 +45,15 @@ def load_checkpoint_with_lora_mapping(runner, filename, strict=False, logger=Non
         k_lookup = k_model[7:] if k_model.startswith('module.') else k_model
         
         if k_lookup in state_dict:
-            new_state_dict[k_model] = state_dict[k_lookup]
+            val = state_dict[k_lookup]
+            if val.shape != model_state[k_model].shape:
+                if logger:
+                    logger.warning(
+                        f"[LoRA Checkpoint Map] Shape mismatch for {k_model}: "
+                        f"checkpoint shape {list(val.shape)}, model shape {list(model_state[k_model].shape)}. Skipping."
+                    )
+                continue
+            new_state_dict[k_model] = val
         else:
             # 检测 .linear.weight / .linear.bias 并尝试匹配原始名称
             k_orig = None
@@ -54,7 +63,15 @@ def load_checkpoint_with_lora_mapping(runner, filename, strict=False, logger=Non
                 k_orig = k_lookup.replace('.linear.bias', '.bias')
             
             if k_orig and k_orig in state_dict:
-                new_state_dict[k_model] = state_dict[k_orig]
+                val = state_dict[k_orig]
+                if val.shape != model_state[k_model].shape:
+                    if logger:
+                        logger.warning(
+                            f"[LoRA Checkpoint Map] Shape mismatch for {k_model} (mapped from {k_orig}): "
+                            f"checkpoint shape {list(val.shape)}, model shape {list(model_state[k_model].shape)}. Skipping."
+                        )
+                    continue
+                new_state_dict[k_model] = val
                 mapped_count += 1
                 
     if logger:

@@ -126,6 +126,10 @@ class HungarianAssigner(BaseAssigner):
 
         # 3. do Hungarian matching on CPU using linear_sum_assignment
         cost = cost.detach().cpu()
+        
+        # Guard against NaN/Inf values that cause SciPy's linear_sum_assignment to crash
+        cost = torch.nan_to_num(cost, nan=10000.0, posinf=10000.0, neginf=-10000.0)
+
         if linear_sum_assignment is None:
             raise ImportError('Please run "pip install scipy" '
                               'to install scipy first.')

@@ -15,7 +15,7 @@
 _base_ = ["./base_e2e_b2d.py"]
 
 # 预训练权重
-load_from = "/data/Bench2DriveZoo/adzoo/uniad/new_work_dirs/stage2/iter_7500.pth"
+load_from = "adzoo/uniad/new_work_dirs/stage1/ablation/0.4r=32n/iter_14500.pth"
 
 # ── 目标场景定义 ──
 target_scenarios = ["ParkedObstacleTwoWays"]
@@ -24,19 +24,19 @@ target_scenarios = ["ParkedObstacleTwoWays"]
 if "ParkedObstacleTwoWays" in target_scenarios:
     # 针对双向避障场景的特化优化：
     # 1. 采用 RelativeCollisionLoss 避免训练中自车因安全框膨胀与真实绕行轨迹冲突；
-    # 2. 收紧 delta 碰撞检测半径（0.0/0.25/0.5），降低避障时惩罚过重导致的“不敢绕行”或“过度转向”；
-    # 3. 引入 PlanningDirectionLoss (方向/航向角损失) 直接监督轨迹的切线方向，提升绕行与回正控制精度。
+    # 2. 收紧 delta 碰撞检测半径并提高权重，强化绕行避障惩罚强度；
+    # 3. 引入 PlanningDirectionLoss (方向/航向角损失) 直接监督轨迹的切线方向，已通过 mask 解决梯度爆炸问题，提升绕行与回正控制精度。
     planning_head_cfg = dict(
         loss_collision=[
-            dict(type='RelativeCollisionLoss', delta=0.0, weight=0.1),
-            dict(type='RelativeCollisionLoss', delta=0.25, weight=0.04),
-            dict(type='RelativeCollisionLoss', delta=0.5, weight=0.01)
+            dict(type='RelativeCollisionLoss', delta=0.0, weight=1.5),
+            dict(type='RelativeCollisionLoss', delta=0.25, weight=0.6),
+            dict(type='RelativeCollisionLoss', delta=0.5, weight=0.15)
         ],
-        loss_direction=None,  # Disabled to prevent gradient explosion
+        loss_direction=None,
         col_optim_args=dict(
             occ_filter_range=7.5,     # 从 5.0 增大到 7.5，更早避让障碍
-            sigma=0.5,
-            alpha_collision=8.0,     # 避障排斥力度
+            sigma=0.8,                # 设为 0.8，既扩大感应范围，又避免势场过平坦导致排斥力微弱
+            alpha_collision=25.0,     # 大幅增大到 25.0，增强避障排斥力以实现足够大的转向角度
         )
     )
 else:
@@ -66,7 +66,7 @@ model = dict(
         planning_lora=dict(r=16, alpha=32),    # Stage 3 PlanningHead: scale=2
         inject_q2o_feat=True,  # 向 query_to_occ_feat 注入 LoRA；False 用于消融/旧权重兼容
         pretrained_path="ckpts/uniad_base_b2d.pth",
-        training_stage=3,  # 切换阶段：1=Motion / 2=OCC / 3=Planning+Motion联合
+        training_stage=2,  # 切换阶段：1=Motion / 2=OCC / 3=Planning+Motion联合
         filter_non_target_planning_loss=True,  # 是否在 Stage 3 训练中屏蔽非目标场景的规划损失
     ),
     motion_head=dict(
@@ -84,7 +84,7 @@ model = dict(
         map=1.0,
         motion=1.0,
         occ=1.0,
-        planning=2.0,
+        planning=4.0,
     ),
     planning_head=planning_head_cfg,
 )
@@ -109,13 +109,13 @@ eval_scenario_filter = ["ParkedObstacleTwoWays"] # 可选：None / ["ParkedObsta
 # ── 过采样配置：针对特定场景做场景级过采样（LoRA 快速验证用）──
 data = dict(
     samples_per_gpu=1,
-    workers_per_gpu=2,
+    workers_per_gpu=1,
     train=dict(
         oversample_cfg=dict(
             enable=True,                            # True 时启用
             scenarios=target_scenarios,              # 要过采样的场景
-            ratio=0,                                 # 额外复制
-            max_other_frames=67945,               # 其他场景限制帧数
+            ratio=1,                                 # 额外复制
+            max_other_frames=22648,               # 其他场景限制帧数
             seed=42,
         ),
     ),
@@ -143,7 +143,7 @@ evaluation = dict(
     early_stopping=dict(
         metric='auto',            # 自动匹配训练阶段: stage1→motion_min_ade, stage2→occ_iou, stage3→planning_L2
         rule='auto',              # 自动匹配: motion/planning→less, occ→greater
-        patience=10,               
+        patience=8,               
         min_delta=0,          # 改善需超过阈值才算有效
         warmup_iters=500,         # 前 500 iter 不触发早停（warmup 阶段）
     )

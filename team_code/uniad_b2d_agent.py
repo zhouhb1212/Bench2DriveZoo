@@ -88,7 +88,7 @@ class UniadAgent(autonomous_agent.AutonomousAgent):
                     plg_lib = importlib.import_module(_module_path)  
   
         self.model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'), test_cfg=cfg.get('test_cfg'))
-        checkpoint = load_checkpoint(self.model, self.ckpt_path, map_location='cpu', strict=True)
+        checkpoint = load_checkpoint(self.model, self.ckpt_path, map_location='cpu', strict=False)
         self.model.cuda()
         self.model.eval()
         self.inference_only_pipeline = []

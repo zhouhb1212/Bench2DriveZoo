@@ -206,6 +206,39 @@ class MOPCoupledLoRA:
                     q2o.layers[i] = inject_lora_to_linear(
                         old_lin, r=r, alpha=alpha, dropout=dropout)
 
+        # Inject LoRA into mode_fuser
+        if hasattr(self.occ_head, 'mode_fuser'):
+            fuser = self.occ_head.mode_fuser
+            if len(fuser) > 0 and isinstance(fuser[0], nn.Linear):
+                fuser[0] = inject_lora_to_linear(
+                    fuser[0], r=r, alpha=alpha, dropout=dropout)
+
+        # Inject LoRA into multi_query_fuser
+        if hasattr(self.occ_head, 'multi_query_fuser'):
+            fuser = self.occ_head.multi_query_fuser
+            for i in range(len(fuser)):
+                if isinstance(fuser[i], nn.Linear):
+                    fuser[i] = inject_lora_to_linear(
+                        fuser[i], r=r, alpha=alpha, dropout=dropout)
+
+        # Inject LoRA into temporal_mlp_for_mask
+        if hasattr(self.occ_head, 'temporal_mlp_for_mask'):
+            t_mlp = self.occ_head.temporal_mlp_for_mask
+            if hasattr(t_mlp, 'layers'):
+                for i in range(len(t_mlp.layers)):
+                    old_lin = t_mlp.layers[i]
+                    t_mlp.layers[i] = inject_lora_to_linear(
+                        old_lin, r=r, alpha=alpha, dropout=dropout)
+
+        # Inject LoRA into temporal_mlps
+        if hasattr(self.occ_head, 'temporal_mlps'):
+            for tfl in self.occ_head.temporal_mlps:
+                if hasattr(tfl, 'layers'):
+                    for i in range(len(tfl.layers)):
+                        old_lin = tfl.layers[i]
+                        tfl.layers[i] = inject_lora_to_linear(
+                            old_lin, r=r, alpha=alpha, dropout=dropout)
+
     def _inject_planning_head(self):
         """
         向 PlanningHeadSingleMode 的 adapter 路径注入 LoRA。

@@ -182,7 +182,12 @@ class PlanningDirectionLoss(nn.Module):
         # 过滤掉地面真实位移过小（如 < 0.1米）的步骤，避免在车辆静止/极慢速时产生无意义/噪声极大的单位向量方向监督
         gt_dist = torch.sqrt(torch.sum(gt_dirs ** 2, dim=-1))
         dir_mask = (gt_dist > 0.1).to(mask.dtype)
-        mask = mask * dir_mask
+        
+        # 过滤掉预测位移过小（如 < 0.05米）的步骤，防止在车辆静止/极慢速时或预测移动向量极小时产生梯度爆炸
+        pred_dist = torch.sqrt(torch.sum(pred_dirs ** 2, dim=-1))
+        pred_dir_mask = (pred_dist > 0.05).to(mask.dtype)
+        
+        mask = mask * dir_mask * pred_dir_mask
         
         # 使用更稳定的归一化方式代替 F.normalize，防止在预测移动向量极小时梯度爆炸
         pred_dirs_sq = torch.sum(pred_dirs ** 2, dim=-1, keepdim=True)
