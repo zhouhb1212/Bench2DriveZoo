@@ -15,7 +15,7 @@
 _base_ = ["./base_e2e_b2d.py"]
 
 # 预训练权重
-load_from = "adzoo/uniad/new_work_dirs/stage1/ablation/0.4r=32n/iter_14500.pth"
+load_from = "/data/Bench2DriveZoo/adzoo/uniad/new_work_dirs/stage2/ablation/0.8r=3216/best_composite_iou_pq_iter_2500.pth"
 
 # ── 目标场景定义 ──
 target_scenarios = ["ParkedObstacleTwoWays"]
@@ -34,9 +34,9 @@ if "ParkedObstacleTwoWays" in target_scenarios:
         ],
         loss_direction=None,
         col_optim_args=dict(
-            occ_filter_range=7.5,     # 从 5.0 增大到 7.5，更早避让障碍
-            sigma=0.8,                # 设为 0.8，既扩大感应范围，又避免势场过平坦导致排斥力微弱
-            alpha_collision=25.0,     # 大幅增大到 25.0，增强避障排斥力以实现足够大的转向角度
+            occ_filter_range=4.0,     
+            sigma=0.5,               
+            alpha_collision=30.0,    
         )
     )
 else:
@@ -63,10 +63,10 @@ model = dict(
         # Per-head LoRA 参数覆写（可选，不指定时回退到全局默认值）
         motion_lora=dict(r=32, alpha=64),      # Stage 1 Motion: scale=2
         occ_lora=dict(r=16, alpha=32),         # Stage 2 OccHead: scale=2
-        planning_lora=dict(r=16, alpha=32),    # Stage 3 PlanningHead: scale=2
+        planning_lora=dict(r=32, alpha=64),    # Stage 3 PlanningHead: scale=2
         inject_q2o_feat=True,  # 向 query_to_occ_feat 注入 LoRA；False 用于消融/旧权重兼容
-        pretrained_path="ckpts/uniad_base_b2d.pth",
-        training_stage=2,  # 切换阶段：1=Motion / 2=OCC / 3=Planning+Motion联合
+        pretrained_path="/data/Bench2DriveZoo/ckpts/uniad_base_b2d.pth",
+        training_stage=3,  # 切换阶段：1=Motion / 2=OCC / 3=Planning+Motion联合
         filter_non_target_planning_loss=True,  # 是否在 Stage 3 训练中屏蔽非目标场景的规划损失
     ),
     motion_head=dict(
@@ -115,7 +115,7 @@ data = dict(
             enable=True,                            # True 时启用
             scenarios=target_scenarios,              # 要过采样的场景
             ratio=1,                                 # 额外复制
-            max_other_frames=22648,               # 其他场景限制帧数
+            max_other_frames=7550,               # 其他场景限制帧数
             seed=42,
         ),
     ),

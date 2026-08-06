@@ -25,7 +25,7 @@ class MOPCoupledLoRA:
     Motion-Occupancy-Planning LoRA 管理器。
 
     负责:
-        1. 向 MotionHead(motionformer), OccHead, PlanningHead 精确注入 LoRA
+        1. 向 MotionHead, OccHead, PlanningHead 精确注入 LoRA
         2. 管理三阶段训练的 freeze / unfreeze
 
     三阶段训练:
